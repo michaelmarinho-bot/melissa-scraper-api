@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: melissa-scraper-lite
+    runtime: python
+    plan: free
+    buildCommand: chmod +x build.sh && ./build.sh
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: MELISSA_API_SECRET
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: SUPERAPP_EMAIL
+        sync: false
+      - key: SUPERAPP_PASSWORD
+        sync: false
+      - key: CLASSROOM_EMAIL
+        sync: false
+      - key: CLASSROOM_PASSWORD
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.11.0"
