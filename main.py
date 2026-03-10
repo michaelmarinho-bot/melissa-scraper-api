@@ -28,7 +28,7 @@ from bs4 import BeautifulSoup
 # ============================================================
 # CONFIGURAÇÃO
 # ============================================================
-API_SECRET = os.environ.get("MELISSA_API_SECRET", "trocar-por-uma-chave-segura")
+API_SECRET = os.environ.get("MELISSA_API_SECRET", "") or os.environ.get("MELISSA_API_KEY", "trocar-por-uma-chave-segura")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
 SUPERAPP_EMAIL = os.environ.get("SUPERAPP_EMAIL", "")
