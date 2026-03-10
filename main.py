@@ -30,6 +30,7 @@ from bs4 import BeautifulSoup
 # ============================================================
 API_SECRET = os.environ.get("MELISSA_API_SECRET", "trocar-por-uma-chave-segura")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
 SUPERAPP_EMAIL = os.environ.get("SUPERAPP_EMAIL", "")
 SUPERAPP_PASSWORD = os.environ.get("SUPERAPP_PASSWORD", "")
 CLASSROOM_EMAIL = os.environ.get("CLASSROOM_EMAIL", "")
@@ -81,7 +82,7 @@ def chamar_openai(system_prompt: str, user_prompt: str, model: str = "gpt-4.1-mi
     
     try:
         resp = http_requests.post(
-            "https://api.openai.com/v1/chat/completions",
+            f"{OPENAI_BASE_URL}/chat/completions",
             headers={
                 "Authorization": f"Bearer {OPENAI_API_KEY}",
                 "Content-Type": "application/json"
