@@ -599,6 +599,7 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
     - Provas de Inglês
     Usa o mesmo método de login do Classroom: faz Google Login PRIMEIRO,
     depois navega para o Roteiro já autenticado.
+    Aguarda o Glide App carregar antes de coletar dados.
     """
     from playwright.async_api import async_playwright
 
@@ -613,8 +614,6 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
     password = req.password or MELISSA_PASSWORD
 
     async with async_playwright() as p:
-        # headless=False + Xvfb = browser real com display virtual
-        # Isso evita detecção de bot e CAPTCHA do Google
         browser = await p.chromium.launch(
             headless=False,
             args=[
@@ -645,77 +644,133 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
                 await browser.close()
                 return dados
 
-            # 2. Agora navegar para o Roteiro de Estudos já autenticado
+            # 2. Navegar para o Roteiro de Estudos já autenticado
             logger.info("Navegando para o Roteiro de Estudos (já autenticado)...")
-            await page.goto("https://roteiro.jardim.li/dl/d0a5f4", wait_until="networkidle", timeout=30000)
-            await page.wait_for_timeout(5000)
+            await page.goto("https://roteiro.jardim.li/dl/d0a5f4", wait_until="domcontentloaded", timeout=60000)
 
-            # Verificar se ainda redirecionou para login (fallback)
-            if "accounts.google.com" in page.url:
-                logger.warning("Ainda redirecionou para login, tentando novamente...")
-                login_ok = await google_login(page, email, password)
-                if login_ok:
-                    await page.goto("https://roteiro.jardim.li/dl/d0a5f4", wait_until="networkidle", timeout=30000)
-                    await page.wait_for_timeout(5000)
-                else:
-                    dados["erros"].append("Falha no login Google para o Roteiro (segunda tentativa)")
+            # 3. Aguardar o Glide App carregar (SPA - conteúdo via JavaScript)
+            logger.info("Aguardando Glide App carregar...")
+            try:
+                await page.wait_for_selector('div[role="button"]', timeout=30000)
+                logger.info("Glide App carregou - itens encontrados!")
+            except Exception:
+                # Fallback: aguardar mais tempo
+                logger.warning("Seletor div[role=button] não encontrado, aguardando mais...")
+                await page.wait_for_timeout(15000)
 
-            # Extrair texto da página
+            # Verificar se carregou
             page_text = await page.evaluate("document.body.innerText")
             logger.info(f"Roteiro: {len(page_text)} chars na página")
 
-            # Tentar encontrar abas AO, AD, Inglês
-            abas = ["AD", "AO", "Inglês"]
-            for aba_nome in abas:
+            # 4. Coletar dados de cada aba: AD, AO, Inglês
+            abas_config = [
+                {"nome": "AD", "chave": "provas_ad"},
+                {"nome": "AO", "chave": "provas_ao"},
+                {"nome": "Inglês", "chave": "provas_ingles"},
+            ]
+
+            for aba_cfg in abas_config:
+                aba_nome = aba_cfg["nome"]
+                aba_chave = aba_cfg["chave"]
                 try:
-                    aba = page.locator(f'button:has-text("{aba_nome}"), a:has-text("{aba_nome}"), [role="tab"]:has-text("{aba_nome}")')
-                    if await aba.count() > 0:
-                        await aba.first.click()
+                    # Clicar na aba
+                    aba_btn = page.locator(f'button:has-text("{aba_nome}")')
+                    if await aba_btn.count() > 0:
+                        await aba_btn.first.click()
+                        logger.info(f"Clicou na aba {aba_nome}")
                         await page.wait_for_timeout(3000)
 
-                        # Extrair conteúdo da aba
-                        aba_text = await page.evaluate("document.body.innerText")
+                        # Aguardar itens carregarem
+                        try:
+                            await page.wait_for_selector('div[role="button"]', timeout=10000)
+                        except Exception:
+                            await page.wait_for_timeout(5000)
 
-                        # Clicar em cada item da lista para ver detalhes
-                        items = page.locator('.list-item, [data-testid*="list"], .glide-list-item')
+                        # Coletar todos os itens da lista
+                        items = page.locator('div[role="button"]')
                         item_count = await items.count()
+                        logger.info(f"Aba {aba_nome}: {item_count} itens na lista")
 
                         provas_aba = []
                         for i in range(item_count):
                             try:
-                                await items.nth(i).click()
-                                await page.wait_for_timeout(2000)
+                                # Pegar texto do item na lista (tipo, matéria, data)
+                                item_text = await items.nth(i).inner_text()
+                                logger.info(f"  Item {i}: {item_text[:80]}")
 
-                                item_text = await page.evaluate("document.body.innerText")
-                                provas_aba.append({
-                                    "texto_raw": item_text[:3000],
+                                # Clicar no item para ver detalhes
+                                await items.nth(i).click()
+                                await page.wait_for_timeout(3000)
+
+                                # Extrair detalhes da página do item
+                                detalhe_text = await page.evaluate("document.body.innerText")
+
+                                # Parsear os campos do detalhe
+                                prova = {
+                                    "tipo": aba_nome,
+                                    "item_lista": item_text.strip(),
+                                    "detalhes_raw": detalhe_text[:5000],
                                     "indice": i
-                                })
+                                }
+
+                                # Tentar extrair campos específicos
+                                linhas = detalhe_text.split("\n")
+                                for idx, linha in enumerate(linhas):
+                                    linha_strip = linha.strip()
+                                    if "Conteúdos e Direcionamentos" in linha_strip:
+                                        if idx + 1 < len(linhas):
+                                            prova["conteudos"] = linhas[idx + 1].strip()
+                                    elif "Páginas" in linha_strip and "Materiais" in linha_strip:
+                                        if idx + 1 < len(linhas):
+                                            prova["paginas_materiais"] = linhas[idx + 1].strip()
+                                    elif "Dicas de estudo" in linha_strip:
+                                        if idx + 1 < len(linhas):
+                                            prova["dicas_estudo"] = linhas[idx + 1].strip()
+
+                                provas_aba.append(prova)
 
                                 # Voltar para a lista
-                                back_btn = page.locator('button[aria-label="Back"], button:has-text("Voltar"), .back-button')
+                                back_btn = page.locator('button:has-text("Voltar")')
                                 if await back_btn.count() > 0:
                                     await back_btn.first.click()
-                                    await page.wait_for_timeout(1000)
+                                    await page.wait_for_timeout(2000)
+                                    # Aguardar lista recarregar
+                                    try:
+                                        await page.wait_for_selector('div[role="button"]', timeout=10000)
+                                    except Exception:
+                                        await page.wait_for_timeout(3000)
+                                else:
+                                    # Fallback: navegar de volta
+                                    await page.go_back()
+                                    await page.wait_for_timeout(3000)
 
                             except Exception as e:
                                 logger.warning(f"Erro ao acessar item {i} da aba {aba_nome}: {e}")
+                                # Tentar voltar para a lista
+                                try:
+                                    back_btn = page.locator('button:has-text("Voltar")')
+                                    if await back_btn.count() > 0:
+                                        await back_btn.first.click()
+                                        await page.wait_for_timeout(2000)
+                                except Exception:
+                                    pass
 
-                        if aba_nome == "AO":
-                            dados["provas_ao"] = provas_aba
-                        elif aba_nome == "AD":
-                            dados["provas_ad"] = provas_aba
-                        elif aba_nome == "Inglês":
-                            dados["provas_ingles"] = provas_aba
+                        dados[aba_chave] = provas_aba
+                        logger.info(f"Aba {aba_nome}: {len(provas_aba)} provas coletadas com detalhes")
 
-                        logger.info(f"Aba {aba_nome}: {len(provas_aba)} itens encontrados")
+                    else:
+                        logger.warning(f"Aba {aba_nome} não encontrada")
+                        dados["erros"].append(f"Aba {aba_nome} não encontrada")
 
                 except Exception as e:
+                    logger.error(f"Erro na aba {aba_nome}: {e}")
                     dados["erros"].append(f"Aba {aba_nome}: {str(e)}")
 
-            # Fallback: extrair todo o texto da página
-            if not dados["provas_ao"] and not dados["provas_ad"]:
+            # Fallback: se nenhuma prova coletada, extrair texto completo
+            if not dados["provas_ao"] and not dados["provas_ad"] and not dados["provas_ingles"]:
+                page_text = await page.evaluate("document.body.innerText")
                 dados["texto_completo"] = page_text[:15000]
+                logger.warning("Nenhuma prova coletada, salvando texto completo como fallback")
 
         except Exception as e:
             logger.error(f"Erro geral Roteiro: {e}\n{traceback.format_exc()}")
