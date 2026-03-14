@@ -614,10 +614,9 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
     password = req.password or MELISSA_PASSWORD
 
     async with async_playwright() as p:
-        # headless=False + Xvfb = browser real com display virtual (IGUAL AO CLASSROOM)
-        # Isso evita detecção de bot e CAPTCHA do Google
+        # headless=True para economizar memória (Glide App é pesado)
         browser = await p.chromium.launch(
-            headless=False,
+            headless=True,
             args=[
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
@@ -625,6 +624,12 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
                 "--disable-gpu",
                 "--disable-blink-features=AutomationControlled",
                 "--window-size=1280,800",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-default-apps",
+                "--disable-sync",
+                "--no-first-run",
+                "--single-process",
             ]
         )
 
@@ -636,6 +641,11 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
 
         page = await context.new_page()
 
+        # Bloquear imagens, fontes e CSS para economizar memória
+        await page.route("**/*.{png,jpg,jpeg,gif,svg,webp,woff,woff2,ttf,eot}", lambda route: route.abort())
+        await page.route("**/fonts.googleapis.com/**", lambda route: route.abort())
+        await page.route("**/fonts.gstatic.com/**", lambda route: route.abort())
+
         try:
             # 1. Login no Google PRIMEIRO (mesmo método do Classroom)
             logger.info("Iniciando login no Google (método Classroom)...")
@@ -646,13 +656,13 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
                 await browser.close()
                 return dados
 
-            # 2. Navegar para o Roteiro de Estudos já autenticado (MESMO MÉTODO DO CLASSROOM)
+            # 2. Navegar para o Roteiro de Estudos já autenticado
+            # NOTA: Glide App faz polling contínuo, networkidle NUNCA completa e causa OOM
+            # Por isso usamos domcontentloaded + espera fixa
             logger.info("Navegando para o Roteiro de Estudos (já autenticado)...")
-            try:
-                await page.goto("https://roteiro.jardim.li/dl/d0a5f4", wait_until="networkidle", timeout=30000)
-            except Exception as e:
-                logger.warning(f"Timeout no networkidle do Roteiro (normal para Glide): {e}")
-            await page.wait_for_timeout(5000)
+            await page.goto("https://roteiro.jardim.li/dl/d0a5f4", wait_until="domcontentloaded", timeout=30000)
+            logger.info("DOM carregado, aguardando Glide App renderizar...")
+            await page.wait_for_timeout(10000)
 
             # 3. Verificar se estamos no Roteiro
             current_url = page.url
