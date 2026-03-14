@@ -558,11 +558,6 @@ async def scrape_superapp_async(req: ScrapeRequest) -> dict:
                         break
 
                 if notas_frame:
-                    # Ler texto inicial para ver lista de matérias
-                    text_inicial = await notas_frame.evaluate("document.body.innerText")
-                    logger.info(f"Texto inicial notas: {len(text_inicial)} chars")
-
-                    # Extrair lista de matérias do texto
                     materias_conhecidas = [
                         'LEM - Espanhol', 'Arte', 'Educação Física', 'Redação',
                         'Geografia', 'História', 'Língua Portuguesa', 'Matemática',
@@ -570,115 +565,94 @@ async def scrape_superapp_async(req: ScrapeRequest) -> dict:
                         'MAT - Álgebra', 'LP - Leitura'
                     ]
 
-                    # Expandir TODAS as matérias clicando em cada uma via frame_locator
-                    for materia in materias_conhecidas:
-                        try:
-                            mat_el = notas_fl.locator(f'text={materia}').first
-                            if await mat_el.count() > 0:
-                                await mat_el.click()
-                                await page.wait_for_timeout(1500)
-                                logger.info(f"Expandiu: {materia}")
-                        except Exception as e:
-                            logger.warning(f"Erro ao expandir {materia}: {e}")
-
-                    # Aguardar tudo renderizar
-                    await page.wait_for_timeout(3000)
-
-                    # Capturar texto completo com todas as matérias expandidas
-                    texto_completo = await notas_frame.evaluate("document.body.innerText")
-                    logger.info(f"Texto completo notas: {len(texto_completo)} chars")
-
-                    # Parsear o texto expandido em estrutura por matéria
-                    notas_detalhadas = []
-                    lines = texto_completo.split('\n')
-                    current_materia = None
-                    current_data = None
-                    avaliacoes = []
-
                     skip_lines = {'Melissa Majado Marinho', '(1) Anexo', '1º Bimestre', '2º Bimestre',
                                   '3º Bimestre', '4º Bimestre', '8 E', 'Atual', '', '/'}
 
-                    i = 0
-                    while i < len(lines):
-                        line = lines[i].strip()
-                        i += 1
-                        if line in skip_lines or line.startswith('(') and line.endswith(')'):
-                            continue
-
-                        # Detectar matéria
-                        if line in materias_conhecidas:
-                            # Salvar matéria anterior
-                            if current_materia and current_data:
-                                current_data["avaliacoes"] = avaliacoes
-                                notas_detalhadas.append(current_data)
-
-                            current_materia = line
-                            current_data = {
-                                "materia": line,
-                                "resultado_final": "-",
-                                "faltas": "0",
-                                "avaliacoes": []
-                            }
-                            avaliacoes = []
-                            # Próxima linha é a nota resumo
-                            if i < len(lines):
-                                nota_resumo = lines[i].strip()
-                                if nota_resumo == '-' or nota_resumo.replace(',', '').replace('.', '').isdigit():
-                                    current_data["resultado_final"] = nota_resumo
-                                    i += 1
-                            continue
-
-                        # Detectar categorias de avaliação
-                        if current_materia and line in ['Avaliação Dissertativa', 'Avaliação Objetiva',
-                                                         'Outros Instrumentos avaliativos']:
-                            continue  # Apenas header, próximas linhas são as avaliações
-
-                        # Detectar Resultado Final
-                        if current_materia and line == 'Resultado Final':
-                            if i < len(lines):
-                                val = lines[i].strip()
-                                if val == '-' or val.replace(',', '').replace('.', '').isdigit():
-                                    current_data["resultado_final"] = val
-                                    i += 1
-                            continue
-
-                        # Detectar Faltas
-                        if current_materia and line == 'Faltas':
-                            if i < len(lines):
-                                val = lines[i].strip()
-                                if val.isdigit():
-                                    current_data["faltas"] = val
-                                    i += 1
-                            continue
-
-                        # Detectar avaliação (nome da avaliação seguido de nota e /max)
-                        if current_materia and line and line not in skip_lines:
-                            # Verificar se é nome de avaliação (ex: "AO 1 Manhã - Matemática e Espanhol")
-                            if not line.replace(',', '').replace('.', '').isdigit() and line != '-' and line != '/':
-                                # Pode ser nome de avaliação
-                                aval = {"nome": line, "nota": "-", "max": ""}
-                                # Próxima linha pode ser nota
+                    def parse_materia_text(texto, materia_nome):
+                        """Parseia o texto expandido de uma matéria individual"""
+                        data = {"materia": materia_nome, "resultado_final": "-", "faltas": "0", "avaliacoes": []}
+                        lines = texto.split('\n')
+                        avaliacoes = []
+                        found_materia = False
+                        i = 0
+                        while i < len(lines):
+                            line = lines[i].strip()
+                            i += 1
+                            if line in skip_lines or (line.startswith('(') and line.endswith(')')):
+                                continue
+                            # Pular outras matérias (colapsadas)
+                            if line in materias_conhecidas and line != materia_nome:
+                                if found_materia:
+                                    break  # Chegou na próxima matéria, parar
+                                continue
+                            if line == materia_nome:
+                                found_materia = True
+                                # Próxima linha é nota resumo
                                 if i < len(lines):
-                                    nota_val = lines[i].strip()
-                                    if nota_val == '-' or nota_val.replace(',', '').replace('.', '').isdigit():
-                                        aval["nota"] = nota_val
+                                    nr = lines[i].strip()
+                                    if nr == '-' or nr.replace(',', '').replace('.', '').isdigit():
                                         i += 1
-                                # Próxima pode ser "/"
-                                if i < len(lines) and lines[i].strip() == '/':
-                                    i += 1
-                                # Próxima pode ser max
+                                continue
+                            if not found_materia:
+                                continue
+                            # Categorias de avaliação (headers)
+                            if line in ['Avaliação Dissertativa', 'Avaliação Objetiva', 'Outros Instrumentos avaliativos']:
+                                continue
+                            if line == 'Resultado Final':
                                 if i < len(lines):
-                                    max_val = lines[i].strip()
-                                    if max_val.replace(',', '').replace('.', '').isdigit():
-                                        aval["max"] = max_val
+                                    val = lines[i].strip()
+                                    if val == '-' or val.replace(',', '').replace('.', '').isdigit():
+                                        data["resultado_final"] = val
                                         i += 1
-                                if aval["max"]:  # Só adicionar se tem nota máxima (é avaliação real)
-                                    avaliacoes.append(aval)
+                                continue
+                            if line == 'Faltas':
+                                if i < len(lines):
+                                    val = lines[i].strip()
+                                    if val.isdigit():
+                                        data["faltas"] = val
+                                        i += 1
+                                continue
+                            # Avaliação: nome seguido de nota / max
+                            if line and line not in skip_lines:
+                                if not line.replace(',', '').replace('.', '').isdigit() and line != '-' and line != '/':
+                                    aval = {"nome": line, "nota": "-", "max": ""}
+                                    if i < len(lines):
+                                        nv = lines[i].strip()
+                                        if nv == '-' or nv.replace(',', '').replace('.', '').isdigit():
+                                            aval["nota"] = nv
+                                            i += 1
+                                    if i < len(lines) and lines[i].strip() == '/':
+                                        i += 1
+                                    if i < len(lines):
+                                        mv = lines[i].strip()
+                                        if mv.replace(',', '').replace('.', '').isdigit():
+                                            aval["max"] = mv
+                                            i += 1
+                                    if aval["max"]:
+                                        avaliacoes.append(aval)
+                        data["avaliacoes"] = avaliacoes
+                        return data
 
-                    # Salvar última matéria
-                    if current_materia and current_data:
-                        current_data["avaliacoes"] = avaliacoes
-                        notas_detalhadas.append(current_data)
+                    # Expandir UMA matéria por vez, capturar texto, colapsar
+                    notas_detalhadas = []
+                    for materia in materias_conhecidas:
+                        try:
+                            mat_el = notas_fl.locator(f'text="{materia}"').first
+                            if await mat_el.count() > 0:
+                                # Expandir
+                                await mat_el.click()
+                                await page.wait_for_timeout(2000)
+                                # Capturar texto com esta matéria expandida
+                                texto = await notas_frame.evaluate("document.body.innerText")
+                                parsed = parse_materia_text(texto, materia)
+                                notas_detalhadas.append(parsed)
+                                logger.info(f"Notas {materia}: {len(parsed['avaliacoes'])} avaliacoes")
+                                # Colapsar (clicar de novo)
+                                await mat_el.click()
+                                await page.wait_for_timeout(500)
+                        except Exception as e:
+                            logger.warning(f"Erro ao coletar notas de {materia}: {e}")
+                            notas_detalhadas.append({"materia": materia, "erro": str(e)})
 
                     dados["notas"] = notas_detalhadas
                     logger.info(f"Notas detalhadas: {len(notas_detalhadas)} matérias")
