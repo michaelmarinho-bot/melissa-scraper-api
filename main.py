@@ -432,17 +432,19 @@ async def scrape_classroom_async(req: ScrapeRequest) -> dict:
 async def scrape_superapp_async(req: ScrapeRequest) -> dict:
     """
     Navega no SuperApp Layers via Playwright e coleta:
-    - Conteúdo de Aula (via Sophia iframe)
-    - Notas Acadêmicas
-    - Registros Acadêmicos
+    - Notas Acadêmicas (Gradebooks) - via iframe layers-notas-academicas.web.app
+    - Registros Acadêmicos (Academic Records) - via iframe layers-registros-academicos.web.app
+    - Conteúdo de Aula (via Sophia iframe) - pesquisa por matéria, últimos 60 dias
+
+    Login: direto no Layers (id.layers.digital) com email/senha.
+    Usa mesma config do Classroom (headless=False + Xvfb).
     """
     from playwright.async_api import async_playwright
 
     dados = {
-        "conteudos": [],
         "notas": [],
         "registros": [],
-        "frequencia": [],
+        "conteudos": [],
         "erros": []
     }
 
@@ -450,6 +452,7 @@ async def scrape_superapp_async(req: ScrapeRequest) -> dict:
     password = req.password or SUPERAPP_PASSWORD
 
     async with async_playwright() as p:
+        # Mesma config do Classroom que funciona
         browser = await p.chromium.launch(
             headless=False,
             args=[
@@ -471,104 +474,263 @@ async def scrape_superapp_async(req: ScrapeRequest) -> dict:
         page = await context.new_page()
 
         try:
-            # 1. Login no SuperApp
+            # ========================================
+            # 1. LOGIN NO LAYERS
+            # ========================================
             logger.info("Acessando SuperApp Layers...")
-            await page.goto("https://liceu-jardim.layers.education/@liceu-jardim/", wait_until="networkidle", timeout=30000)
-            await page.wait_for_timeout(3000)
+            await page.goto("https://liceu-jardim.layers.education/@liceu-jardim/", wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(5000)
 
-            # Verificar se precisa fazer login
+            # Verificar se redirecionou para login (id.layers.digital)
+            current_url = page.url
+            logger.info(f"URL atual: {current_url}")
+
+            if "id.layers.digital" in current_url or "login" in current_url.lower():
+                logger.info("Fazendo login no Layers...")
+
+                # Inserir email
+                email_input = page.locator('input[type="email"]')
+                await email_input.wait_for(state="visible", timeout=10000)
+                await email_input.fill(email)
+                await page.wait_for_timeout(500)
+
+                # Clicar Continue
+                continue_btn = page.locator('button:has-text("Continue"), button:has-text("Continuar")')
+                if await continue_btn.count() > 0:
+                    await continue_btn.first.click()
+                    logger.info("Clicou Continue, aguardando tela de senha...")
+                    await page.wait_for_timeout(3000)
+
+                # Inserir senha
+                password_input = page.locator('input[type="password"]')
+                await password_input.wait_for(state="visible", timeout=10000)
+                await password_input.fill(password)
+                await page.wait_for_timeout(500)
+
+                # Clicar Enter/Entrar
+                enter_btn = page.locator('button:has-text("Enter"), button:has-text("Entrar")')
+                if await enter_btn.count() > 0:
+                    await enter_btn.first.click()
+                    logger.info("Clicou Enter, aguardando login completar...")
+                    await page.wait_for_timeout(8000)
+
+                current_url = page.url
+                logger.info(f"URL após login: {current_url}")
+
+            # Verificar se logou com sucesso
             page_text = await page.evaluate("document.body.innerText")
-            if "Entrar" in page_text or "Login" in page_text or "login" in page.url:
-                logger.info("Fazendo login no SuperApp...")
+            if "Melissa" in page_text or "My Apps" in page_text or "Home" in page_text:
+                logger.info("Login SuperApp OK!")
+            else:
+                logger.warning(f"Login pode ter falhado. Texto: {page_text[:300]}")
+                dados["erros"].append("Login SuperApp pode ter falhado")
 
-                # Clicar em Entrar
+            # ========================================
+            # 2. NOTAS ACADÊMICAS (GRADEBOOKS)
+            # ========================================
+            logger.info("Acessando Notas Acadêmicas...")
+            try:
+                # Navegar direto para Gradebooks
+                await page.goto(
+                    "https://liceu-jardim.layers.education/@liceu-jardim/portal/@admin:layers-notas-academicas",
+                    wait_until="domcontentloaded", timeout=30000
+                )
+                await page.wait_for_timeout(5000)
+
+                # Clicar em "See grades"
+                see_grades = page.locator('button:has-text("See grades"), button:has-text("Ver notas")')
+                if await see_grades.count() > 0:
+                    await see_grades.first.click()
+                    logger.info("Clicou See grades")
+                    await page.wait_for_timeout(5000)
+
+                # O conteúdo está dentro de um iframe cross-origin
+                # Usar frame_locator do Playwright para acessar
+                notas_frame = page.frame_locator('iframe[src*="layers-notas-academicas"]')
+
+                # Tentar extrair o texto completo do iframe
                 try:
-                    entrar_btn = page.locator('button:has-text("Entrar"), a:has-text("Entrar"), button:has-text("Login")')
-                    if await entrar_btn.count() > 0:
-                        await entrar_btn.first.click()
-                        await page.wait_for_timeout(2000)
+                    iframe_text = await notas_frame.locator('body').inner_text(timeout=10000)
+                    logger.info(f"Texto do iframe de notas: {len(iframe_text)} chars")
+
+                    # Parsear matérias e notas do texto
+                    materias_notas = []
+                    lines = iframe_text.split('\n')
+                    materias_conhecidas = [
+                        'LEM - Espanhol', 'Arte', 'Educação Física', 'Redação',
+                        'Geografia', 'História', 'Língua Portuguesa', 'Matemática',
+                        'Ciências', 'LEM - Inglês', 'MAT - Geometria', 'LP - Gramática',
+                        'MAT - Álgebra', 'LP - Leitura'
+                    ]
+                    current_materia = None
+                    for line in lines:
+                        line = line.strip()
+                        if not line or line in ['1º Bimestre', '2º Bimestre', '3º Bimestre', '4º Bimestre', 'Atual', '8 E']:
+                            continue
+                        if line in materias_conhecidas:
+                            current_materia = line
+                            materias_notas.append({"materia": current_materia, "nota": "-"})
+                        elif current_materia and (line.replace('.', '').replace(',', '').isdigit() or line == '-'):
+                            if materias_notas:
+                                materias_notas[-1]["nota"] = line
+
+                    dados["notas"] = materias_notas
+                    logger.info(f"Notas coletadas: {len(materias_notas)} matérias")
+
+                except Exception as e:
+                    logger.warning(f"Erro ao acessar iframe de notas: {e}")
+                    # Fallback: extrair texto da página inteira
+                    page_text = await page.evaluate("document.body.innerText")
+                    dados["notas"] = [{"texto_raw": page_text[:10000]}]
+
+                # Verificar Attachment (boletim)
+                try:
+                    attachment_btn = page.locator('button:has-text("Attachment")')
+                    if await attachment_btn.count() > 0:
+                        dados["notas_attachment"] = True
+                        logger.info("Botão de Attachment (boletim) encontrado")
                 except:
                     pass
 
-                # Inserir email
-                try:
-                    email_input = page.locator('input[type="email"], input[name="email"], input[placeholder*="mail"]')
-                    if await email_input.count() > 0:
-                        await email_input.first.fill(email)
-                        await page.wait_for_timeout(500)
-
-                    # Inserir senha
-                    pwd_input = page.locator('input[type="password"], input[name="password"]')
-                    if await pwd_input.count() > 0:
-                        await pwd_input.first.fill(password)
-                        await page.wait_for_timeout(500)
-
-                    # Clicar em Entrar/Submit
-                    submit_btn = page.locator('button[type="submit"], button:has-text("Entrar"), button:has-text("Login")')
-                    if await submit_btn.count() > 0:
-                        await submit_btn.first.click()
-                        await page.wait_for_timeout(5000)
-
-                except Exception as e:
-                    dados["erros"].append(f"Erro no login SuperApp: {str(e)}")
-
-            # Verificar se logou
-            page_text = await page.evaluate("document.body.innerText")
-            logger.info(f"SuperApp - Texto da página (primeiros 500 chars): {page_text[:500]}")
-
-            # 2. Navegar para Notas Acadêmicas
-            logger.info("Acessando Notas Acadêmicas...")
-            try:
-                notas_link = page.locator('a:has-text("Notas"), a:has-text("Gradebook"), button:has-text("Notas")')
-                if await notas_link.count() > 0:
-                    await notas_link.first.click()
-                    await page.wait_for_timeout(5000)
-
-                    # Extrair texto da página de notas
-                    notas_text = await page.evaluate("document.body.innerText")
-                    dados["notas"] = [{"texto_raw": notas_text[:10000]}]
-                    logger.info(f"Notas: {len(notas_text)} chars extraídos")
             except Exception as e:
+                logger.error(f"Erro em Notas Acadêmicas: {e}")
                 dados["erros"].append(f"Notas: {str(e)}")
 
-            # 3. Voltar e navegar para Registros Acadêmicos
+            # ========================================
+            # 3. REGISTROS ACADÊMICOS
+            # ========================================
             logger.info("Acessando Registros Acadêmicos...")
             try:
-                await page.goto("https://liceu-jardim.layers.education/@liceu-jardim/", wait_until="networkidle", timeout=30000)
-                await page.wait_for_timeout(3000)
+                await page.goto(
+                    "https://liceu-jardim.layers.education/@liceu-jardim/portal/@admin:layers-registros-academicos",
+                    wait_until="domcontentloaded", timeout=30000
+                )
+                await page.wait_for_timeout(5000)
 
-                registros_link = page.locator('a:has-text("Registros"), a:has-text("Records"), button:has-text("Registros")')
-                if await registros_link.count() > 0:
-                    await registros_link.first.click()
+                # Clicar em "See all" / "Ver tudo"
+                see_all = page.locator('button:has-text("See all"), button:has-text("Ver tudo"), a:has-text("See all")')
+                if await see_all.count() > 0:
+                    await see_all.first.click()
+                    logger.info("Clicou See all em Registros")
                     await page.wait_for_timeout(5000)
 
-                    # Clicar em "See all" / "Ver tudo"
-                    see_all = page.locator('button:has-text("See all"), button:has-text("Ver tudo"), a:has-text("See all")')
-                    if await see_all.count() > 0:
-                        await see_all.first.click()
-                        await page.wait_for_timeout(3000)
+                # Tentar iframe primeiro
+                registros_frame = page.frame_locator('iframe[src*="layers-registros-academicos"]')
+                try:
+                    iframe_text = await registros_frame.locator('body').inner_text(timeout=10000)
+                    logger.info(f"Texto do iframe de registros: {len(iframe_text)} chars")
 
-                    registros_text = await page.evaluate("document.body.innerText")
-                    dados["registros"] = [{"texto_raw": registros_text[:10000]}]
-                    logger.info(f"Registros: {len(registros_text)} chars extraídos")
+                    # Parsear registros do texto
+                    registros = []
+                    lines = iframe_text.split('\n')
+                    i = 0
+                    while i < len(lines):
+                        line = lines[i].strip()
+                        if not line:
+                            i += 1
+                            continue
+                        # Detectar registro pelo padrão: status/tempo/matéria-descrição
+                        if any(keyword in line for keyword in ['ago', 'day', 'month', 'week', 'New', 'Read']):
+                            registro = {"raw": line}
+                            # Tentar parsear
+                            if ' · ' in line:
+                                parts = line.split(' · ')
+                                if len(parts) >= 3:
+                                    registro["status"] = parts[0].strip()
+                                    registro["tempo"] = parts[1].strip()
+                                    materia_desc = parts[2].strip()
+                                    if ' - ' in materia_desc:
+                                        m_parts = materia_desc.split(' - ', 1)
+                                        registro["materia"] = m_parts[0].strip()
+                                        registro["descricao"] = m_parts[1].strip()
+                                    else:
+                                        registro["descricao"] = materia_desc
+                            registros.append(registro)
+                        i += 1
+
+                    dados["registros"] = registros if registros else [{"texto_raw": iframe_text[:10000]}]
+                    logger.info(f"Registros coletados: {len(registros)}")
+
+                except Exception:
+                    # Fallback: extrair texto da página
+                    page_text = await page.evaluate("document.body.innerText")
+                    registros = []
+                    for line in page_text.split('\n'):
+                        line = line.strip()
+                        if ' · ' in line:
+                            parts = line.split(' · ')
+                            registro = {}
+                            if len(parts) >= 3:
+                                registro["status"] = parts[0].strip()
+                                registro["tempo"] = parts[1].strip()
+                                materia_desc = parts[2].strip()
+                                if ' - ' in materia_desc:
+                                    m_parts = materia_desc.split(' - ', 1)
+                                    registro["materia"] = m_parts[0].strip()
+                                    registro["descricao"] = m_parts[1].strip()
+                                else:
+                                    registro["descricao"] = materia_desc
+                            if registro:
+                                registros.append(registro)
+                    dados["registros"] = registros if registros else [{"texto_raw": page_text[:10000]}]
+                    logger.info(f"Registros (fallback): {len(registros)}")
+
             except Exception as e:
+                logger.error(f"Erro em Registros Acadêmicos: {e}")
                 dados["erros"].append(f"Registros: {str(e)}")
 
-            # 4. Conteúdo de Aula
+            # ========================================
+            # 4. CONTEÚDO DE AULA (SOPHIA)
+            # ========================================
             logger.info("Acessando Conteúdo de Aula...")
             try:
-                await page.goto("https://liceu-jardim.layers.education/@liceu-jardim/", wait_until="networkidle", timeout=30000)
-                await page.wait_for_timeout(3000)
+                await page.goto(
+                    "https://liceu-jardim.layers.education/@liceu-jardim/portal/@sophiabylayers:conteudo-de-aula",
+                    wait_until="domcontentloaded", timeout=30000
+                )
+                await page.wait_for_timeout(5000)
 
-                conteudo_link = page.locator('a:has-text("Conteúdo"), button:has-text("Conteúdo"), a:has-text("Content")')
-                if await conteudo_link.count() > 0:
-                    await conteudo_link.first.click()
-                    await page.wait_for_timeout(8000)
+                # O conteúdo está dentro de iframe do Sophia
+                sophia_frame = page.frame_locator('iframe[src*="sophia"]')
+                try:
+                    # Clicar em "Ver conteúdo"
+                    ver_conteudo = sophia_frame.locator('button:has-text("Ver conteúdo"), a:has-text("Ver conteúdo")')
+                    if await ver_conteudo.count() > 0:
+                        await ver_conteudo.first.click()
+                        logger.info("Clicou Ver conteúdo")
+                        await page.wait_for_timeout(5000)
 
-                    conteudo_text = await page.evaluate("document.body.innerText")
-                    dados["conteudos"] = [{"texto_raw": conteudo_text[:10000]}]
-                    logger.info(f"Conteúdo de Aula: {len(conteudo_text)} chars extraídos")
+                    # Pular tutorial se aparecer
+                    try:
+                        pular_btn = sophia_frame.locator('button:has-text("Pular"), a:has-text("Pular")')
+                        if await pular_btn.count() > 0:
+                            await pular_btn.first.click()
+                            await page.wait_for_timeout(2000)
+                    except:
+                        pass
+
+                    # Tentar navegar para visualização por disciplina
+                    try:
+                        disciplina_btn = sophia_frame.locator('button:has-text("Disciplina"), a:has-text("Disciplina")')
+                        if await disciplina_btn.count() > 0:
+                            await disciplina_btn.first.click()
+                            logger.info("Selecionou visualização por Disciplina")
+                            await page.wait_for_timeout(3000)
+                    except:
+                        pass
+
+                    # Coletar texto do iframe
+                    conteudo_text = await sophia_frame.locator('body').inner_text(timeout=10000)
+                    logger.info(f"Conteúdo de aula: {len(conteudo_text)} chars")
+                    dados["conteudos"] = [{"texto_raw": conteudo_text[:15000]}]
+
+                except Exception as e:
+                    logger.warning(f"Erro no iframe Sophia: {e}")
+                    page_text = await page.evaluate("document.body.innerText")
+                    dados["conteudos"] = [{"texto_raw": page_text[:10000]}]
+
             except Exception as e:
+                logger.error(f"Erro em Conteúdo de Aula: {e}")
                 dados["erros"].append(f"Conteúdo de Aula: {str(e)}")
 
         except Exception as e:
@@ -579,9 +741,9 @@ async def scrape_superapp_async(req: ScrapeRequest) -> dict:
             await browser.close()
 
     dados["resumo"] = {
-        "total_conteudos": len(dados["conteudos"]),
         "total_notas": len(dados["notas"]),
         "total_registros": len(dados["registros"]),
+        "total_conteudos": len(dados["conteudos"]),
         "total_erros": len(dados["erros"])
     }
 
