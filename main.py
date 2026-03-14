@@ -530,21 +530,13 @@ async def scrape_superapp_async(req: ScrapeRequest) -> dict:
             # ========================================
             logger.info("Acessando Notas Acadêmicas...")
             try:
-                # Navegar direto para Gradebooks overview
+                # Navegar DIRETO para a página de notas (pula overview)
                 await page.goto(
-                    "https://liceu-jardim.layers.education/@liceu-jardim/portal/@admin:layers-notas-academicas",
+                    "https://liceu-jardim.layers.education/@liceu-jardim/portal/@admin:layers-notas-academicas/gradebooks/55514",
                     wait_until="domcontentloaded", timeout=30000
                 )
-                await page.wait_for_timeout(8000)  # Esperar mais para o SPA carregar
-
-                # Clicar em "See grades" (botão na página principal, NÃO no iframe)
-                see_grades = page.locator('button:has-text("See grades"), button:has-text("Ver notas"), a:has-text("See grades"), a:has-text("Ver notas")')
-                sg_count = await see_grades.count()
-                logger.info(f"Botões See grades encontrados: {sg_count}")
-                if sg_count > 0:
-                    await see_grades.first.click()
-                    logger.info("Clicou See grades")
-                    await page.wait_for_timeout(8000)  # Esperar iframe carregar
+                await page.wait_for_timeout(10000)  # Esperar iframe carregar
+                logger.info(f"URL notas: {page.url}")
 
                 # O conteúdo está dentro de um iframe cross-origin
                 # iframe src: https://layers-notas-academicas.web.app/
@@ -625,7 +617,12 @@ async def scrape_superapp_async(req: ScrapeRequest) -> dict:
                     "https://liceu-jardim.layers.education/@liceu-jardim/portal/@admin:layers-registros-academicos/group/19656",
                     wait_until="domcontentloaded", timeout=30000
                 )
-                await page.wait_for_timeout(5000)
+                await page.wait_for_timeout(8000)  # Esperar registros carregarem
+                logger.info(f"URL registros: {page.url}")
+
+                # Log do texto da página para debug
+                debug_text = await page.evaluate("document.body.innerText")
+                logger.info(f"Texto registros (primeiros 500): {debug_text[:500]}")
 
                 # Registros NÃO estão em iframe - conteúdo direto na página
                 # Cada registro é um <a> com texto no formato:
