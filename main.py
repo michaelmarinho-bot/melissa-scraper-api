@@ -979,10 +979,11 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
     - Provas AO (Avaliação Objetiva)
     - Provas AD (Avaliação Dissertativa)
     - Provas de Inglês
-    Navega DIRETO para o Roteiro e faz login pelo botão "Continuar com Google"
-    que aparece na própria página do Glide App.
+    Estratégia: Navega direto para o Roteiro, clica "Continuar com Google",
+    preenche email/senha no popup do Google, e coleta os dados.
     """
     from playwright.async_api import async_playwright
+    import asyncio as _asyncio
 
     dados = {
         "provas_ao": [],
@@ -995,7 +996,6 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
     password = req.password or MELISSA_PASSWORD
 
     async with async_playwright() as p:
-        # headless=False + Xvfb (mesmo padrão do Classroom que funciona)
         browser = await p.chromium.launch(
             headless=False,
             args=[
@@ -1016,7 +1016,7 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
 
         page = await context.new_page()
 
-        # Bloquear imagens, fontes, CSS e media para economizar memória
+        # Bloquear imagens, fontes e analytics para economizar memória
         await page.route("**/*.{png,jpg,jpeg,gif,svg,webp,woff,woff2,ttf,eot,mp4,mp3,avi}", lambda route: route.abort())
         await page.route("**/fonts.googleapis.com/**", lambda route: route.abort())
         await page.route("**/fonts.gstatic.com/**", lambda route: route.abort())
@@ -1024,66 +1024,80 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
         await page.route("**/www.googletagmanager.com/**", lambda route: route.abort())
 
         try:
-            # 1. Navegar DIRETO para o Roteiro de Estudos
-            logger.info("Navegando direto para o Roteiro de Estudos...")
+            # 1. NAVEGAR DIRETO PARA O ROTEIRO
+            logger.info("[Roteiro] Navegando para o Roteiro de Estudos...")
             await page.goto("https://roteiro.jardim.li/dl/d0a5f4", wait_until="domcontentloaded", timeout=30000)
             await page.wait_for_timeout(5000)
 
-            # 2. Clicar em "Continue with Google" na página do Roteiro
-            logger.info("Procurando botão 'Continue with Google'...")
+            page_text = await page.evaluate("document.body.innerText")
+            logger.info(f"[Roteiro] Texto inicial: {page_text[:200]}")
+
+            # 2. CLICAR EM "CONTINUAR COM GOOGLE" E FAZER LOGIN NO POPUP
             google_btn = page.locator('#sign-in-with-google-button')
-            btn_count = await google_btn.count()
-            logger.info(f"Botões Google encontrados: {btn_count}")
+            if await google_btn.count() > 0:
+                logger.info("[Roteiro] Clicando 'Continuar com Google' e aguardando popup...")
 
-            if btn_count > 0:
-                await google_btn.first.click()
-                logger.info("Clicou em 'Continuar com o Google'")
-                await page.wait_for_timeout(5000)
+                # Capturar o popup que vai abrir
+                async with context.expect_page() as popup_info:
+                    await google_btn.first.click()
 
-                # 3. Preencher email no formulário do Google
-                current_url = page.url
-                logger.info(f"URL após clicar Google: {current_url}")
+                popup = await popup_info.value
+                await popup.wait_for_load_state("domcontentloaded")
+                logger.info(f"[Roteiro] Popup aberto: {popup.url[:100]}")
+                await popup.wait_for_timeout(3000)
 
-                # Verificar se abriu popup ou redirecionou
-                pages = context.pages
-                login_page = pages[-1] if len(pages) > 1 else page
-                logger.info(f"Páginas abertas: {len(pages)}")
-
-                # Inserir email
-                email_input = login_page.locator('input[type="email"]')
+                # 3. PREENCHER EMAIL NO POPUP
+                logger.info("[Roteiro] Preenchendo email no popup...")
+                email_input = popup.locator('input[type="email"]')
                 await email_input.wait_for(state="visible", timeout=10000)
                 await email_input.fill(email)
-                await login_page.wait_for_timeout(500)
-                await login_page.locator('#identifierNext button').click()
-                logger.info("Email inserido, aguardando tela de senha...")
-                await login_page.wait_for_timeout(4000)
+                await popup.wait_for_timeout(500)
 
-                # Inserir senha
-                password_input = login_page.locator('input[type="password"]')
-                await password_input.wait_for(state="visible", timeout=15000)
-                await password_input.fill(password)
-                await login_page.wait_for_timeout(500)
-                await login_page.locator('#passwordNext button').click()
-                logger.info("Senha inserida, aguardando login completar...")
-                await login_page.wait_for_timeout(5000)
+                # Clicar Avançar
+                next_btn = popup.locator('#identifierNext button')
+                if await next_btn.count() > 0:
+                    await next_btn.first.click()
+                else:
+                    next_btn2 = popup.locator('button:has-text("Avançar"), button:has-text("Next")')
+                    await next_btn2.first.click()
+                logger.info("[Roteiro] Email enviado, aguardando senha...")
+                await popup.wait_for_timeout(5000)
 
-                # Verificar se voltou para o Roteiro
-                current_url = page.url
-                logger.info(f"URL após login: {current_url}")
+                # 4. PREENCHER SENHA NO POPUP
+                logger.info("[Roteiro] Preenchendo senha...")
+                password_input = popup.locator('input[type="password"]')
+                await password_input.first.wait_for(state="visible", timeout=15000)
+                await password_input.first.fill(password)
+                await popup.wait_for_timeout(500)
+
+                pwd_next = popup.locator('#passwordNext button')
+                if await pwd_next.count() > 0:
+                    await pwd_next.first.click()
+                else:
+                    pwd_next2 = popup.locator('button:has-text("Avançar"), button:has-text("Next")')
+                    await pwd_next2.first.click()
+                logger.info("[Roteiro] Senha enviada, aguardando popup fechar...")
+
+                # Aguardar popup fechar (redireciona e fecha automaticamente)
+                for i in range(15):
+                    await _asyncio.sleep(1)
+                    if popup.is_closed():
+                        logger.info(f"[Roteiro] Popup fechou após {i+1}s")
+                        break
+
+                # 5. AGUARDAR ROTEIRO CARREGAR APÓS LOGIN
+                logger.info("[Roteiro] Aguardando Roteiro carregar após login...")
+                await page.wait_for_timeout(10000)
             else:
-                # Talvez já esteja logado, verificar conteúdo
-                page_text = await page.evaluate("document.body.innerText")
-                logger.info(f"Sem botão Google. Texto da página: {page_text[:200]}")
+                # Já está logado (sem botão Google)
+                logger.info("[Roteiro] Sem botão Google - já está logado")
+                await page.wait_for_timeout(5000)
 
-            # 4. Aguardar Glide App carregar após login
-            logger.info("Aguardando Glide App renderizar após login...")
-            await page.wait_for_timeout(10000)
-
-            # Verificar se carregou
+            # 6. VERIFICAR SE CARREGOU
             page_text = await page.evaluate("document.body.innerText")
-            logger.info(f"Roteiro: {len(page_text)} chars na página")
+            logger.info(f"[Roteiro] Texto após login ({len(page_text)} chars): {page_text[:300]}")
 
-            # 5. Coletar dados de cada aba: AD, AO, Inglês
+            # 7. COLETAR DADOS DE CADA ABA: AD, AO, Inglês
             abas_config = [
                 {"nome": "AD", "chave": "provas_ad"},
                 {"nome": "AO", "chave": "provas_ao"},
@@ -1094,27 +1108,23 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
                 aba_nome = aba_cfg["nome"]
                 aba_chave = aba_cfg["chave"]
                 try:
-                    # Clicar na aba
                     aba_btn = page.locator(f'button:has-text("{aba_nome}")')
                     aba_count = await aba_btn.count()
-                    logger.info(f"Procurando aba {aba_nome}: {aba_count} botões encontrados")
+                    logger.info(f"[Roteiro] Procurando aba {aba_nome}: {aba_count} botões")
                     if aba_count > 0:
                         await aba_btn.first.click()
-                        logger.info(f"Clicou na aba {aba_nome}")
                         await page.wait_for_timeout(3000)
 
-                        # Coletar todos os itens da lista via JavaScript
                         items_data = await page.evaluate("""
                             () => {
                                 const items = document.querySelectorAll('div[role="button"]');
                                 return Array.from(items).map(item => item.innerText.trim());
                             }
                         """)
-                        logger.info(f"Aba {aba_nome}: {len(items_data)} itens encontrados via JS")
+                        logger.info(f"[Roteiro] Aba {aba_nome}: {len(items_data)} itens")
 
                         provas_aba = []
                         for i, item_text in enumerate(items_data):
-                            logger.info(f"  Item {i}: {item_text[:80]}")
                             prova = {
                                 "tipo": aba_nome,
                                 "item_lista": item_text,
@@ -1128,24 +1138,23 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
                             provas_aba.append(prova)
 
                         dados[aba_chave] = provas_aba
-                        logger.info(f"Aba {aba_nome}: {len(provas_aba)} provas coletadas")
-
+                        logger.info(f"[Roteiro] Aba {aba_nome}: {len(provas_aba)} provas coletadas")
                     else:
-                        logger.warning(f"Aba {aba_nome} não encontrada")
+                        logger.warning(f"[Roteiro] Aba {aba_nome} não encontrada")
                         dados["erros"].append(f"Aba {aba_nome} não encontrada")
 
                 except Exception as e:
-                    logger.error(f"Erro na aba {aba_nome}: {e}")
+                    logger.error(f"[Roteiro] Erro na aba {aba_nome}: {e}")
                     dados["erros"].append(f"Aba {aba_nome}: {str(e)}")
 
-            # Fallback: se nenhuma prova coletada, extrair texto completo
+            # Fallback
             if not dados["provas_ao"] and not dados["provas_ad"] and not dados["provas_ingles"]:
                 page_text = await page.evaluate("document.body.innerText")
                 dados["texto_completo"] = page_text[:15000]
-                logger.warning(f"Nenhuma prova coletada. Texto da página ({len(page_text)} chars) salvo como fallback")
+                logger.warning(f"[Roteiro] Nenhuma prova coletada. Texto ({len(page_text)} chars) salvo como fallback")
 
         except Exception as e:
-            logger.error(f"Erro geral Roteiro: {e}\n{traceback.format_exc()}")
+            logger.error(f"[Roteiro] Erro geral: {e}\n{traceback.format_exc()}")
             dados["erros"].append(f"Erro geral: {str(e)}")
 
         finally:
