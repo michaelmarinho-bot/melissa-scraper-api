@@ -92,7 +92,7 @@ async def google_login(page, email: str, password: str, max_retries: int = 3):
             logger.info(f"Tentativa de login Google {attempt + 1}/{max_retries}...")
 
             # Navegar para o login do Google
-            await page.goto("https://accounts.google.com/signin", wait_until="networkidle", timeout=30000)
+            await page.goto("https://accounts.google.com/signin", wait_until="domcontentloaded", timeout=30000)
             await page.wait_for_timeout(3000)
 
             # Verificar se já está logado
@@ -614,9 +614,10 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
     password = req.password or MELISSA_PASSWORD
 
     async with async_playwright() as p:
-        # headless=True para economizar memória (Glide App é pesado)
+        # headless=False + Xvfb = browser real com display virtual
+        # Necessário para Google Login funcionar sem CAPTCHA
         browser = await p.chromium.launch(
-            headless=True,
+            headless=False,
             args=[
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
@@ -629,7 +630,6 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
                 "--disable-default-apps",
                 "--disable-sync",
                 "--no-first-run",
-                "--single-process",
             ]
         )
 
