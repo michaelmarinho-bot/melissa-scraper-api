@@ -526,23 +526,33 @@ async def scrape_superapp_async(req: ScrapeRequest) -> dict:
                 dados["erros"].append("Login SuperApp pode ter falhado")
 
             # ========================================
-            # 2. NOTAS ACADÊMICAS (GRADEBOOKS) - IFRAME cross-origin
+            # 2. NOTAS ACADÊMICAS (GRADEBOOKS) - via clique no menu + iframe
             # ========================================
             logger.info("Acessando Notas Acadêmicas...")
             try:
-                # Navegar DIRETO para a página de notas (pula overview)
-                await page.goto(
-                    "https://liceu-jardim.layers.education/@liceu-jardim/portal/@admin:layers-notas-academicas/gradebooks/55514",
-                    wait_until="domcontentloaded", timeout=30000
-                )
-                await page.wait_for_timeout(10000)  # Esperar iframe carregar
-                logger.info(f"URL notas: {page.url}")
+                # Clicar em "Gradebooks" no menu lateral (SPA - precisa clicar, não navegar por URL)
+                gradebooks_link = page.locator('a:has-text("Gradebooks"), a:has-text("Notas Acadêmicas")')
+                if await gradebooks_link.count() > 0:
+                    await gradebooks_link.first.click()
+                    logger.info("Clicou Gradebooks no menu")
+                    await page.wait_for_timeout(5000)
+                else:
+                    logger.warning("Link Gradebooks não encontrado no menu")
 
-                # O conteúdo está dentro de um iframe cross-origin
-                # iframe src: https://layers-notas-academicas.web.app/
-                # Tentar via frame_locator primeiro
+                # Agora clicar em "See grades" - está DENTRO do iframe layers-notas-academicas
                 notas_frame = page.frame_locator('iframe[src*="layers-notas-academicas"]')
+                try:
+                    see_grades_btn = notas_frame.locator('button:has-text("See grades"), a:has-text("See grades"), button:has-text("Ver notas"), a:has-text("Ver notas")')
+                    sg_count = await see_grades_btn.count()
+                    logger.info(f"Botões See grades no iframe: {sg_count}")
+                    if sg_count > 0:
+                        await see_grades_btn.first.click()
+                        logger.info("Clicou See grades dentro do iframe")
+                        await page.wait_for_timeout(8000)  # Esperar notas carregarem
+                except Exception as e:
+                    logger.warning(f"Erro ao clicar See grades no iframe: {e}")
 
+                # Ler conteúdo do iframe de notas
                 try:
                     iframe_text = await notas_frame.locator('body').inner_text(timeout=15000)
                     logger.info(f"Texto do iframe de notas: {len(iframe_text)} chars")
@@ -572,12 +582,11 @@ async def scrape_superapp_async(req: ScrapeRequest) -> dict:
                     if materias_notas:
                         dados["notas"] = materias_notas
                     else:
-                        # Se não conseguiu parsear, salvar texto raw
                         dados["notas"] = [{"texto_raw": iframe_text[:10000]}]
                     logger.info(f"Notas coletadas: {len(materias_notas)} matérias")
 
                 except Exception as e:
-                    logger.warning(f"Erro ao acessar iframe de notas via frame_locator: {e}")
+                    logger.warning(f"Erro ao ler iframe de notas: {e}")
                     # Fallback: tentar via page.frame()
                     try:
                         frame = page.frame(url=lambda u: "layers-notas-academicas" in u)
@@ -586,108 +595,99 @@ async def scrape_superapp_async(req: ScrapeRequest) -> dict:
                             logger.info(f"Texto via page.frame(): {len(iframe_text)} chars")
                             dados["notas"] = [{"texto_raw": iframe_text[:10000]}]
                         else:
-                            logger.warning("Frame de notas não encontrado")
-                            page_text = await page.evaluate("document.body.innerText")
-                            dados["notas"] = [{"texto_raw": page_text[:10000]}]
+                            dados["notas"] = [{"erro": "Frame de notas não encontrado"}]
                     except Exception as e2:
-                        logger.warning(f"Fallback page.frame() também falhou: {e2}")
-                        page_text = await page.evaluate("document.body.innerText")
-                        dados["notas"] = [{"texto_raw": page_text[:10000]}]
-
-                # Verificar Attachment (boletim) - botão na página principal
-                try:
-                    attachment_btn = page.locator('button:has-text("Attachment"), button:has-text("Anexo")')
-                    if await attachment_btn.count() > 0:
-                        dados["notas_attachment"] = True
-                        logger.info("Botão de Attachment (boletim) encontrado")
-                except:
-                    pass
+                        logger.warning(f"Fallback também falhou: {e2}")
+                        dados["notas"] = [{"erro": str(e2)}]
 
             except Exception as e:
                 logger.error(f"Erro em Notas Acadêmicas: {e}")
                 dados["erros"].append(f"Notas: {str(e)}")
 
             # ========================================
-            # 3. REGISTROS ACADÊMICOS (SEM IFRAME - conteúdo direto na página)
+            # 3. REGISTROS ACADÊMICOS - via clique no menu + iframe
             # ========================================
             logger.info("Acessando Registros Acadêmicos...")
             try:
-                # Navegar direto para a página com todos os registros
-                await page.goto(
-                    "https://liceu-jardim.layers.education/@liceu-jardim/portal/@admin:layers-registros-academicos/group/19656",
-                    wait_until="domcontentloaded", timeout=30000
-                )
-                await page.wait_for_timeout(8000)  # Esperar registros carregarem
-                logger.info(f"URL registros: {page.url}")
+                # Clicar em "Academic Records" no menu lateral
+                records_link = page.locator('a:has-text("Academic Records"), a:has-text("Registros Acadêmicos")')
+                if await records_link.count() > 0:
+                    await records_link.first.click()
+                    logger.info("Clicou Academic Records no menu")
+                    await page.wait_for_timeout(5000)
 
-                # Log do texto da página para debug
-                debug_text = await page.evaluate("document.body.innerText")
-                logger.info(f"Texto registros (primeiros 500): {debug_text[:500]}")
+                # Os registros estão no iframe layers-registros-academicos
+                reg_frame = page.frame_locator('iframe[src*="layers-registros-academicos"]')
 
-                # Registros NÃO estão em iframe - conteúdo direto na página
-                # Cada registro é um <a> com texto no formato:
-                # "New/Read X days ago • Matéria Descrição"
-                registros = []
-                registro_links = page.locator('a:has-text("ago"), a:has-text("month"), a:has-text("há"), a:has-text("dia"), a:has-text("mês"), a:has-text("semana")')
-                count = await registro_links.count()
-                logger.info(f"Links de registros encontrados: {count}")
+                # Clicar em "See all" dentro do iframe
+                try:
+                    see_all_btn = reg_frame.locator('button:has-text("See all"), a:has-text("See all"), button:has-text("Ver tudo"), a:has-text("Ver tudo")')
+                    sa_count = await see_all_btn.count()
+                    logger.info(f"Botões See all no iframe: {sa_count}")
+                    if sa_count > 0:
+                        await see_all_btn.first.click()
+                        logger.info("Clicou See all dentro do iframe")
+                        await page.wait_for_timeout(5000)
+                except Exception as e:
+                    logger.warning(f"Erro ao clicar See all: {e}")
 
-                for i in range(count):
+                # Ler conteúdo do iframe de registros
+                try:
+                    reg_text = await reg_frame.locator('body').inner_text(timeout=15000)
+                    logger.info(f"Texto do iframe de registros: {len(reg_text)} chars")
+                    logger.info(f"Primeiros 500 chars registros: {reg_text[:500]}")
+
+                    # Parsear registros do texto
+                    registros = []
+                    lines = reg_text.split('\n')
+                    materias_conhecidas = [
+                        'LEM - Espanhol', 'Arte', 'Educação Física', 'Redação',
+                        'Geografia', 'História', 'Língua Portuguesa', 'Matemática',
+                        'Ciências', 'LEM - Inglês', 'MAT - Geometria', 'LP - Gramática',
+                        'MAT - Álgebra', 'LP - Leitura'
+                    ]
+                    i = 0
+                    while i < len(lines):
+                        line = lines[i].strip()
+                        # Detectar linhas com status (New/Read)
+                        if line in ['New', 'Read', 'Novo', 'Nova', 'Lido', 'Lida']:
+                            registro = {"status": "Novo" if line in ['New', 'Novo', 'Nova'] else "Lido"}
+                            # Próxima linha deve ter o tempo
+                            if i + 1 < len(lines):
+                                tempo_line = lines[i + 1].strip()
+                                if '•' in tempo_line:
+                                    parts = tempo_line.split('•', 1)
+                                    registro["tempo"] = parts[0].strip()
+                                    registro["materia"] = parts[1].strip()
+                                else:
+                                    registro["tempo"] = tempo_line
+                            # Próxima linha deve ter a descrição
+                            if i + 2 < len(lines):
+                                desc = lines[i + 2].strip()
+                                if desc and desc not in ['New', 'Read', 'Novo', 'Nova', 'Lido', 'Lida', 'Mark all as read']:
+                                    registro["descricao"] = desc
+                            registros.append(registro)
+                            i += 3
+                        else:
+                            i += 1
+
+                    if registros:
+                        dados["registros"] = registros
+                    else:
+                        dados["registros"] = [{"texto_raw": reg_text[:10000]}]
+                    logger.info(f"Registros coletados: {len(registros)}")
+
+                except Exception as e:
+                    logger.warning(f"Erro ao ler iframe de registros: {e}")
                     try:
-                        texto = await registro_links.nth(i).inner_text()
-                        texto = texto.strip()
-                        if not texto:
-                            continue
-                        registro = {"raw": texto}
-
-                        # Parsear: "New 2 days ago • Arte Sem material"
-                        # ou "Read 9 days ago • LEM - Inglês Sem Lição de Casa"
-                        texto_rest = texto
-                        for prefix in ["New", "Novo", "Nova"]:
-                            if texto.startswith(prefix):
-                                registro["status"] = "Novo"
-                                texto_rest = texto[len(prefix):].strip()
-                                break
-                        for prefix in ["Read", "Lido", "Lida"]:
-                            if texto.startswith(prefix):
-                                registro["status"] = "Lido"
-                                texto_rest = texto[len(prefix):].strip()
-                                break
-
-                        # Separar por bullet •
-                        if '•' in texto_rest:
-                            parts = texto_rest.split('•', 1)
-                            registro["tempo"] = parts[0].strip()
-                            materia_desc = parts[1].strip()
-
-                            # Lista de matérias conhecidas para separar matéria da descrição
-                            materias = [
-                                'LEM - Espanhol', 'Arte', 'Educação Física', 'Redação',
-                                'Geografia', 'História', 'Língua Portuguesa', 'Matemática',
-                                'Ciências', 'LEM - Inglês', 'MAT - Geometria', 'LP - Gramática',
-                                'MAT - Álgebra', 'LP - Leitura'
-                            ]
-                            found_materia = False
-                            for mat in materias:
-                                if materia_desc.startswith(mat):
-                                    registro["materia"] = mat
-                                    registro["descricao"] = materia_desc[len(mat):].strip()
-                                    found_materia = True
-                                    break
-                            if not found_materia:
-                                registro["descricao"] = materia_desc
-
-                        registros.append(registro)
-                    except Exception as e:
-                        logger.warning(f"Erro ao parsear registro {i}: {e}")
-
-                if not registros:
-                    # Fallback: extrair texto completo da página
-                    page_text = await page.evaluate("document.body.innerText")
-                    registros = [{"texto_raw": page_text[:10000]}]
-
-                dados["registros"] = registros
-                logger.info(f"Registros coletados: {len(registros)}")
+                        frame = page.frame(url=lambda u: "layers-registros-academicos" in u)
+                        if frame:
+                            reg_text = await frame.evaluate("document.body.innerText")
+                            dados["registros"] = [{"texto_raw": reg_text[:10000]}]
+                        else:
+                            dados["registros"] = [{"erro": "Frame de registros não encontrado"}]
+                    except Exception as e2:
+                        dados["registros"] = [{"erro": str(e2)}]
 
             except Exception as e:
                 logger.error(f"Erro em Registros Acadêmicos: {e}")
