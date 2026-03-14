@@ -644,32 +644,19 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
                 await browser.close()
                 return dados
 
-            # 2. Navegar para o Roteiro de Estudos já autenticado
+            # 2. Navegar para o Roteiro de Estudos já autenticado (MESMO MÉTODO DO CLASSROOM)
             logger.info("Navegando para o Roteiro de Estudos (já autenticado)...")
-            await page.goto("https://roteiro.jardim.li/dl/d0a5f4", wait_until="domcontentloaded", timeout=90000)
-
-            # 3. Aguardar o Glide App carregar (SPA - conteúdo via JavaScript)
-            logger.info("Aguardando Glide App carregar (networkidle)...")
             try:
-                await page.wait_for_load_state("networkidle", timeout=60000)
-                logger.info("Network idle alcançado")
+                await page.goto("https://roteiro.jardim.li/dl/d0a5f4", wait_until="networkidle", timeout=30000)
             except Exception as e:
-                logger.warning(f"Timeout no networkidle: {e}")
+                logger.warning(f"Timeout no networkidle do Roteiro (normal para Glide): {e}")
+            await page.wait_for_timeout(5000)
 
-            # Aguardar itens da lista aparecerem
-            logger.info("Aguardando itens da lista (div[role=button])...")
-            try:
-                await page.wait_for_selector('div[role="button"]', timeout=60000)
-                logger.info("Glide App carregou - itens encontrados!")
-            except Exception:
-                # Fallback: aguardar mais tempo fixo
-                logger.warning("Seletor div[role=button] não encontrado após 60s, aguardando mais 20s...")
-                await page.wait_for_timeout(20000)
-                # Verificar URL atual para debug
-                current_url = page.url
-                logger.info(f"URL atual após espera: {current_url}")
-                page_title = await page.title()
-                logger.info(f"Título da página: {page_title}")
+            # 3. Verificar se estamos no Roteiro
+            current_url = page.url
+            logger.info(f"URL atual: {current_url}")
+            page_title = await page.title()
+            logger.info(f"Título da página: {page_title}")
 
             # Verificar se carregou
             page_text = await page.evaluate("document.body.innerText")
