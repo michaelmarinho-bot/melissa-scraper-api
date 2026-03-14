@@ -614,36 +614,27 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
     password = req.password or MELISSA_PASSWORD
 
     async with async_playwright() as p:
-        # OTIMIZADO para 512MB RAM: headless=True + bloquear recursos pesados
+        # headless=False + Xvfb = browser real com display virtual (IGUAL AO CLASSROOM)
+        # Isso evita detecção de bot e CAPTCHA do Google
         browser = await p.chromium.launch(
-            headless=True,
+            headless=False,
             args=[
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
                 "--disable-blink-features=AutomationControlled",
-                "--single-process",
-                "--disable-extensions",
-                "--disable-background-networking",
-                "--disable-default-apps",
-                "--no-first-run",
-                "--window-size=800,600",
+                "--window-size=1280,800",
             ]
         )
 
         context = await browser.new_context(
-            viewport={"width": 800, "height": 600},
+            viewport={"width": 1280, "height": 800},
             user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             locale="pt-BR"
         )
 
         page = await context.new_page()
-
-        # Bloquear imagens, CSS e fontes para economizar memória
-        await page.route("**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,eot}", lambda route: route.abort())
-        await page.route("**/fonts.googleapis.com/**", lambda route: route.abort())
-        await page.route("**/fonts.gstatic.com/**", lambda route: route.abort())
 
         try:
             # 1. Login no Google PRIMEIRO (mesmo método do Classroom)
