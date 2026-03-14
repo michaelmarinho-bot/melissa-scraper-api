@@ -694,54 +694,146 @@ async def scrape_superapp_async(req: ScrapeRequest) -> dict:
                 dados["erros"].append(f"Registros: {str(e)}")
 
             # ========================================
-            # 4. CONTEÚDO DE AULA (SOPHIA)
+            # 4. CONTEÚDO DE AULA (SOPHIA) - via clique no menu + iframe appconteudoaula
             # ========================================
             logger.info("Acessando Conteúdo de Aula...")
             try:
-                await page.goto(
-                    "https://liceu-jardim.layers.education/@liceu-jardim/portal/@sophiabylayers:conteudo-de-aula",
-                    wait_until="domcontentloaded", timeout=30000
-                )
-                await page.wait_for_timeout(5000)
+                # Clicar em "Conteúdo de aula" no menu lateral (SPA - precisa clicar)
+                conteudo_link = page.locator('a:has-text("Conteúdo de aula")')
+                if await conteudo_link.count() > 0:
+                    await conteudo_link.first.click()
+                    logger.info("Clicou Conteúdo de aula no menu")
+                    await page.wait_for_timeout(10000)  # Sophia demora para carregar
+                else:
+                    # Fallback: navegar por URL
+                    await page.goto(
+                        "https://liceu-jardim.layers.education/@liceu-jardim/portal/@sophiabylayers:conteudo-de-aula",
+                        wait_until="domcontentloaded", timeout=30000
+                    )
+                    await page.wait_for_timeout(10000)
 
-                # O conteúdo está dentro de iframe do Sophia
-                sophia_frame = page.frame_locator('iframe[src*="sophia"]')
-                try:
-                    # Clicar em "Ver conteúdo"
-                    ver_conteudo = sophia_frame.locator('button:has-text("Ver conteúdo"), a:has-text("Ver conteúdo")')
-                    if await ver_conteudo.count() > 0:
-                        await ver_conteudo.first.click()
-                        logger.info("Clicou Ver conteúdo")
-                        await page.wait_for_timeout(5000)
+                # Encontrar o frame CORRETO: appconteudoaula (NÃO sophia/sophiabylayers)
+                sophia = None
+                for f in page.frames:
+                    if "appconteudoaula" in f.url:
+                        sophia = f
+                        break
 
-                    # Pular tutorial se aparecer
+                if not sophia:
+                    logger.warning("Frame appconteudoaula não encontrado!")
+                    dados["conteudos"] = [{"erro": "Frame Sophia não encontrado"}]
+                else:
+                    # Passo 1: Pular tutorial (via JS evaluate - mais confiável)
                     try:
-                        pular_btn = sophia_frame.locator('button:has-text("Pular"), a:has-text("Pular")')
-                        if await pular_btn.count() > 0:
-                            await pular_btn.first.click()
-                            await page.wait_for_timeout(2000)
+                        await sophia.evaluate("""
+                            () => {
+                                const els = document.querySelectorAll('*');
+                                for (const el of els) {
+                                    if (el.textContent?.trim() === 'Pular') { el.click(); return; }
+                                }
+                            }
+                        """)
+                        logger.info("Tutorial pulado")
+                        await page.wait_for_timeout(3000)
                     except:
-                        pass
+                        logger.info("Sem tutorial para pular")
 
-                    # Tentar navegar para visualização por disciplina
+                    # Passo 2: Clicar "Ver conteúdo" via frame_locator (Playwright click)
+                    fl = page.frame_locator('iframe[src*="appconteudoaula"]')
                     try:
-                        disciplina_btn = sophia_frame.locator('button:has-text("Disciplina"), a:has-text("Disciplina")')
-                        if await disciplina_btn.count() > 0:
-                            await disciplina_btn.first.click()
-                            logger.info("Selecionou visualização por Disciplina")
-                            await page.wait_for_timeout(3000)
-                    except:
-                        pass
+                        ver = fl.locator('h6:has-text("Ver conteúdo")')
+                        if await ver.count() > 0:
+                            await ver.first.click()
+                            logger.info("Clicou Ver conteúdo")
+                            await page.wait_for_timeout(5000)
+                    except Exception as e:
+                        logger.warning(f"Erro ao clicar Ver conteúdo: {e}")
 
-                    # Coletar texto do iframe
-                    conteudo_text = await sophia_frame.locator('body').inner_text(timeout=10000)
-                    logger.info(f"Conteúdo de aula: {len(conteudo_text)} chars")
-                    dados["conteudos"] = [{"texto_raw": conteudo_text[:15000]}]
+                    # Passo 3: Clicar "Por disciplina" (segundo card s-button-menu)
+                    try:
+                        cards = fl.locator('div.s-card.s-button-menu')
+                        card_count = await cards.count()
+                        logger.info(f"Cards de opção: {card_count}")
+                        if card_count >= 2:
+                            await cards.nth(1).click()  # Segundo card = Por disciplina
+                            logger.info("Clicou Por disciplina")
+                            await page.wait_for_timeout(5000)
+                        elif card_count == 1:
+                            await cards.first.click()
+                            await page.wait_for_timeout(5000)
+                    except Exception as e:
+                        logger.warning(f"Erro ao clicar Por disciplina: {e}")
 
-                except Exception as e:
-                    logger.warning(f"Erro no iframe Sophia: {e}")
-                    page_text = await page.evaluate("document.body.innerText")
-                    dados["conteudos"] = [{"texto_raw": page_text[:10000]}]
+                    # Passo 4: Coletar lista de matérias
+                    conteudos_por_materia = []
+                    try:
+                        materias_els = await sophia.evaluate("""
+                            () => {
+                                const els = document.querySelectorAll('div.s-card.s-card-container');
+                                return Array.from(els).map(el => el.textContent?.trim()).filter(t => t && t.length > 2);
+                            }
+                        """)
+                        logger.info(f"Matérias encontradas: {len(materias_els)} - {materias_els}")
+
+                        # Passo 5: Clicar em cada matéria e coletar dados
+                        for materia_nome in materias_els:
+                            try:
+                                # Clicar na matéria
+                                await sophia.evaluate(f"""
+                                    () => {{
+                                        const els = document.querySelectorAll('div.s-card.s-card-container');
+                                        for (const el of els) {{
+                                            if (el.textContent?.trim() === '{materia_nome}') {{
+                                                el.click();
+                                                return;
+                                            }}
+                                        }}
+                                    }}
+                                """)
+                                await page.wait_for_timeout(5000)
+
+                                # Coletar texto da matéria
+                                materia_text = await sophia.evaluate("document.body.innerText")
+                                logger.info(f"Matéria {materia_nome}: {len(materia_text)} chars")
+
+                                conteudos_por_materia.append({
+                                    "materia": materia_nome,
+                                    "conteudo": materia_text[:5000]
+                                })
+
+                                # Voltar para a lista de matérias (clicar botão voltar)
+                                try:
+                                    # Procurar botão voltar no Sophia
+                                    await sophia.evaluate("""
+                                        () => {
+                                            const back = document.querySelector('.s-nav-bar button, [class*="back"], [class*="voltar"]');
+                                            if (back) { back.click(); return; }
+                                            // Fallback: history back
+                                            window.history.back();
+                                        }
+                                    """)
+                                    await page.wait_for_timeout(3000)
+                                except:
+                                    pass
+
+                            except Exception as e:
+                                logger.warning(f"Erro ao coletar {materia_nome}: {e}")
+                                conteudos_por_materia.append({
+                                    "materia": materia_nome,
+                                    "erro": str(e)
+                                })
+
+                    except Exception as e:
+                        logger.warning(f"Erro ao listar matérias: {e}")
+                        # Fallback: pegar texto raw
+                        try:
+                            raw_text = await sophia.evaluate("document.body.innerText")
+                            conteudos_por_materia = [{"texto_raw": raw_text[:15000]}]
+                        except:
+                            pass
+
+                    dados["conteudos"] = conteudos_por_materia
+                    logger.info(f"Conteúdos coletados: {len(conteudos_por_materia)} matérias")
 
             except Exception as e:
                 logger.error(f"Erro em Conteúdo de Aula: {e}")
