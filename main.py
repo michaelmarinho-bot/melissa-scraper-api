@@ -613,10 +613,9 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
     password = req.password or MELISSA_PASSWORD
 
     async with async_playwright() as p:
-        # headless=True para economizar memória (512MB no Render)
-        # Login Google funciona em headless para domínios educacionais (g12.br)
+        # headless=False + Xvfb (mesmo padrão do Classroom que funciona)
         browser = await p.chromium.launch(
-            headless=True,
+            headless=False,
             args=[
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
@@ -624,14 +623,6 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
                 "--disable-gpu",
                 "--disable-blink-features=AutomationControlled",
                 "--window-size=1280,800",
-                "--disable-extensions",
-                "--disable-background-networking",
-                "--disable-default-apps",
-                "--disable-sync",
-                "--no-first-run",
-                "--single-process",
-                "--disable-software-rasterizer",
-                "--js-flags=--max-old-space-size=256",
             ]
         )
 
