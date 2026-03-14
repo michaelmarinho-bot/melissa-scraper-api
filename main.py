@@ -530,75 +530,161 @@ async def scrape_superapp_async(req: ScrapeRequest) -> dict:
             # ========================================
             logger.info("Acessando Notas Acadêmicas...")
             try:
-                # Clicar em "Gradebooks" no menu lateral (SPA - precisa clicar, não navegar por URL)
+                # Clicar em "Gradebooks" no menu lateral
                 gradebooks_link = page.locator('a:has-text("Gradebooks"), a:has-text("Notas Acadêmicas")')
                 if await gradebooks_link.count() > 0:
                     await gradebooks_link.first.click()
                     logger.info("Clicou Gradebooks no menu")
-                    await page.wait_for_timeout(5000)
+                    await page.wait_for_timeout(8000)
                 else:
                     logger.warning("Link Gradebooks não encontrado no menu")
 
-                # Agora clicar em "See grades" - está DENTRO do iframe layers-notas-academicas
-                notas_frame = page.frame_locator('iframe[src*="layers-notas-academicas"]')
+                # Clicar em "Ver notas" dentro do iframe (Playwright click)
+                notas_fl = page.frame_locator('iframe[src*="layers-notas-academicas"]')
                 try:
-                    see_grades_btn = notas_frame.locator('button:has-text("See grades"), a:has-text("See grades"), button:has-text("Ver notas"), a:has-text("Ver notas")')
-                    sg_count = await see_grades_btn.count()
-                    logger.info(f"Botões See grades no iframe: {sg_count}")
-                    if sg_count > 0:
-                        await see_grades_btn.first.click()
-                        logger.info("Clicou See grades dentro do iframe")
-                        await page.wait_for_timeout(8000)  # Esperar notas carregarem
+                    ver_notas_btn = notas_fl.locator('button:has-text("Ver notas"), button:has-text("See grades")')
+                    if await ver_notas_btn.count() > 0:
+                        await ver_notas_btn.first.click()
+                        logger.info("Clicou Ver notas")
+                        await page.wait_for_timeout(8000)
                 except Exception as e:
-                    logger.warning(f"Erro ao clicar See grades no iframe: {e}")
+                    logger.warning(f"Erro ao clicar Ver notas: {e}")
 
-                # Ler conteúdo do iframe de notas
-                try:
-                    iframe_text = await notas_frame.locator('body').inner_text(timeout=15000)
-                    logger.info(f"Texto do iframe de notas: {len(iframe_text)} chars")
-                    logger.info(f"Primeiros 500 chars: {iframe_text[:500]}")
+                # Encontrar o frame real para evaluate
+                notas_frame = None
+                for f in page.frames:
+                    if "layers-notas-academicas.web.app" in f.url:
+                        notas_frame = f
+                        break
 
-                    # Parsear matérias e notas do texto
-                    materias_notas = []
-                    lines = iframe_text.split('\n')
+                if notas_frame:
+                    # Ler texto inicial para ver lista de matérias
+                    text_inicial = await notas_frame.evaluate("document.body.innerText")
+                    logger.info(f"Texto inicial notas: {len(text_inicial)} chars")
+
+                    # Extrair lista de matérias do texto
                     materias_conhecidas = [
                         'LEM - Espanhol', 'Arte', 'Educação Física', 'Redação',
                         'Geografia', 'História', 'Língua Portuguesa', 'Matemática',
                         'Ciências', 'LEM - Inglês', 'MAT - Geometria', 'LP - Gramática',
                         'MAT - Álgebra', 'LP - Leitura'
                     ]
+
+                    # Expandir TODAS as matérias clicando em cada uma via frame_locator
+                    for materia in materias_conhecidas:
+                        try:
+                            mat_el = notas_fl.locator(f'text={materia}').first
+                            if await mat_el.count() > 0:
+                                await mat_el.click()
+                                await page.wait_for_timeout(1500)
+                                logger.info(f"Expandiu: {materia}")
+                        except Exception as e:
+                            logger.warning(f"Erro ao expandir {materia}: {e}")
+
+                    # Aguardar tudo renderizar
+                    await page.wait_for_timeout(3000)
+
+                    # Capturar texto completo com todas as matérias expandidas
+                    texto_completo = await notas_frame.evaluate("document.body.innerText")
+                    logger.info(f"Texto completo notas: {len(texto_completo)} chars")
+
+                    # Parsear o texto expandido em estrutura por matéria
+                    notas_detalhadas = []
+                    lines = texto_completo.split('\n')
                     current_materia = None
-                    for line in lines:
-                        line = line.strip()
-                        if not line or line in ['1º Bimestre', '2º Bimestre', '3º Bimestre', '4º Bimestre', 'Atual', '8 E', 'Melissa Majado Marinho']:
+                    current_data = None
+                    avaliacoes = []
+
+                    skip_lines = {'Melissa Majado Marinho', '(1) Anexo', '1º Bimestre', '2º Bimestre',
+                                  '3º Bimestre', '4º Bimestre', '8 E', 'Atual', '', '/'}
+
+                    i = 0
+                    while i < len(lines):
+                        line = lines[i].strip()
+                        i += 1
+                        if line in skip_lines or line.startswith('(') and line.endswith(')'):
                             continue
+
+                        # Detectar matéria
                         if line in materias_conhecidas:
+                            # Salvar matéria anterior
+                            if current_materia and current_data:
+                                current_data["avaliacoes"] = avaliacoes
+                                notas_detalhadas.append(current_data)
+
                             current_materia = line
-                            materias_notas.append({"materia": current_materia, "nota": "-"})
-                        elif current_materia and (line.replace('.', '').replace(',', '').isdigit() or line == '-'):
-                            if materias_notas:
-                                materias_notas[-1]["nota"] = line
+                            current_data = {
+                                "materia": line,
+                                "resultado_final": "-",
+                                "faltas": "0",
+                                "avaliacoes": []
+                            }
+                            avaliacoes = []
+                            # Próxima linha é a nota resumo
+                            if i < len(lines):
+                                nota_resumo = lines[i].strip()
+                                if nota_resumo == '-' or nota_resumo.replace(',', '').replace('.', '').isdigit():
+                                    current_data["resultado_final"] = nota_resumo
+                                    i += 1
+                            continue
 
-                    if materias_notas:
-                        dados["notas"] = materias_notas
-                    else:
-                        dados["notas"] = [{"texto_raw": iframe_text[:10000]}]
-                    logger.info(f"Notas coletadas: {len(materias_notas)} matérias")
+                        # Detectar categorias de avaliação
+                        if current_materia and line in ['Avaliação Dissertativa', 'Avaliação Objetiva',
+                                                         'Outros Instrumentos avaliativos']:
+                            continue  # Apenas header, próximas linhas são as avaliações
 
-                except Exception as e:
-                    logger.warning(f"Erro ao ler iframe de notas: {e}")
-                    # Fallback: tentar via page.frame()
-                    try:
-                        frame = page.frame(url=lambda u: "layers-notas-academicas" in u)
-                        if frame:
-                            iframe_text = await frame.evaluate("document.body.innerText")
-                            logger.info(f"Texto via page.frame(): {len(iframe_text)} chars")
-                            dados["notas"] = [{"texto_raw": iframe_text[:10000]}]
-                        else:
-                            dados["notas"] = [{"erro": "Frame de notas não encontrado"}]
-                    except Exception as e2:
-                        logger.warning(f"Fallback também falhou: {e2}")
-                        dados["notas"] = [{"erro": str(e2)}]
+                        # Detectar Resultado Final
+                        if current_materia and line == 'Resultado Final':
+                            if i < len(lines):
+                                val = lines[i].strip()
+                                if val == '-' or val.replace(',', '').replace('.', '').isdigit():
+                                    current_data["resultado_final"] = val
+                                    i += 1
+                            continue
+
+                        # Detectar Faltas
+                        if current_materia and line == 'Faltas':
+                            if i < len(lines):
+                                val = lines[i].strip()
+                                if val.isdigit():
+                                    current_data["faltas"] = val
+                                    i += 1
+                            continue
+
+                        # Detectar avaliação (nome da avaliação seguido de nota e /max)
+                        if current_materia and line and line not in skip_lines:
+                            # Verificar se é nome de avaliação (ex: "AO 1 Manhã - Matemática e Espanhol")
+                            if not line.replace(',', '').replace('.', '').isdigit() and line != '-' and line != '/':
+                                # Pode ser nome de avaliação
+                                aval = {"nome": line, "nota": "-", "max": ""}
+                                # Próxima linha pode ser nota
+                                if i < len(lines):
+                                    nota_val = lines[i].strip()
+                                    if nota_val == '-' or nota_val.replace(',', '').replace('.', '').isdigit():
+                                        aval["nota"] = nota_val
+                                        i += 1
+                                # Próxima pode ser "/"
+                                if i < len(lines) and lines[i].strip() == '/':
+                                    i += 1
+                                # Próxima pode ser max
+                                if i < len(lines):
+                                    max_val = lines[i].strip()
+                                    if max_val.replace(',', '').replace('.', '').isdigit():
+                                        aval["max"] = max_val
+                                        i += 1
+                                if aval["max"]:  # Só adicionar se tem nota máxima (é avaliação real)
+                                    avaliacoes.append(aval)
+
+                    # Salvar última matéria
+                    if current_materia and current_data:
+                        current_data["avaliacoes"] = avaliacoes
+                        notas_detalhadas.append(current_data)
+
+                    dados["notas"] = notas_detalhadas
+                    logger.info(f"Notas detalhadas: {len(notas_detalhadas)} matérias")
+                else:
+                    dados["notas"] = [{"erro": "Frame de notas não encontrado"}]
+                    dados["erros"].append("Frame layers-notas-academicas.web.app não encontrado")
 
             except Exception as e:
                 logger.error(f"Erro em Notas Acadêmicas: {e}")
