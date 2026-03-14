@@ -468,7 +468,7 @@ async def scrape_superapp_async(req: ScrapeRequest) -> dict:
         context = await browser.new_context(
             viewport={"width": 1280, "height": 800},
             user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            locale="pt-BR"
+            locale="en-US"
         )
 
         page = await context.new_page()
@@ -519,7 +519,7 @@ async def scrape_superapp_async(req: ScrapeRequest) -> dict:
 
             # Verificar se logou com sucesso
             page_text = await page.evaluate("document.body.innerText")
-            if "Melissa" in page_text or "My Apps" in page_text or "Home" in page_text:
+            if "Melissa" in page_text or "My Apps" in page_text or "Home" in page_text or "Meus apps" in page_text or "Início" in page_text:
                 logger.info("Login SuperApp OK!")
             else:
                 logger.warning(f"Login pode ter falhado. Texto: {page_text[:300]}")
@@ -538,7 +538,7 @@ async def scrape_superapp_async(req: ScrapeRequest) -> dict:
                 await page.wait_for_timeout(8000)  # Esperar mais para o SPA carregar
 
                 # Clicar em "See grades" (botão na página principal, NÃO no iframe)
-                see_grades = page.locator('button:has-text("See grades"), button:has-text("Ver notas")')
+                see_grades = page.locator('button:has-text("See grades"), button:has-text("Ver notas"), a:has-text("See grades"), a:has-text("Ver notas")')
                 sg_count = await see_grades.count()
                 logger.info(f"Botões See grades encontrados: {sg_count}")
                 if sg_count > 0:
@@ -604,7 +604,7 @@ async def scrape_superapp_async(req: ScrapeRequest) -> dict:
 
                 # Verificar Attachment (boletim) - botão na página principal
                 try:
-                    attachment_btn = page.locator('button:has-text("Attachment")')
+                    attachment_btn = page.locator('button:has-text("Attachment"), button:has-text("Anexo")')
                     if await attachment_btn.count() > 0:
                         dados["notas_attachment"] = True
                         logger.info("Botão de Attachment (boletim) encontrado")
@@ -631,7 +631,7 @@ async def scrape_superapp_async(req: ScrapeRequest) -> dict:
                 # Cada registro é um <a> com texto no formato:
                 # "New/Read X days ago • Matéria Descrição"
                 registros = []
-                registro_links = page.locator('a:has-text("ago"), a:has-text("month")')
+                registro_links = page.locator('a:has-text("ago"), a:has-text("month"), a:has-text("há"), a:has-text("dia"), a:has-text("mês"), a:has-text("semana")')
                 count = await registro_links.count()
                 logger.info(f"Links de registros encontrados: {count}")
 
@@ -645,14 +645,17 @@ async def scrape_superapp_async(req: ScrapeRequest) -> dict:
 
                         # Parsear: "New 2 days ago • Arte Sem material"
                         # ou "Read 9 days ago • LEM - Inglês Sem Lição de Casa"
-                        if texto.startswith("New"):
-                            registro["status"] = "New"
-                            texto_rest = texto[3:].strip()
-                        elif texto.startswith("Read"):
-                            registro["status"] = "Read"
-                            texto_rest = texto[4:].strip()
-                        else:
-                            texto_rest = texto
+                        texto_rest = texto
+                        for prefix in ["New", "Novo", "Nova"]:
+                            if texto.startswith(prefix):
+                                registro["status"] = "Novo"
+                                texto_rest = texto[len(prefix):].strip()
+                                break
+                        for prefix in ["Read", "Lido", "Lida"]:
+                            if texto.startswith(prefix):
+                                registro["status"] = "Lido"
+                                texto_rest = texto[len(prefix):].strip()
+                                break
 
                         # Separar por bullet •
                         if '•' in texto_rest:
