@@ -1,7 +1,6 @@
 fastapi
 uvicorn[standard]
 pydantic
-requests
-beautifulsoup4
 gunicorn
+playwright
 openai
