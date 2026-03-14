@@ -18,6 +18,7 @@ import re
 import asyncio
 import logging
 import traceback
+import uuid
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
@@ -39,6 +40,59 @@ SUPERAPP_PASSWORD = os.environ.get("SUPERAPP_PASSWORD", MELISSA_PASSWORD)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("melissa-scraper")
+
+# ============================================================
+# SISTEMA DE JOBS ASSÍNCRONOS
+# ============================================================
+# Armazena jobs em memória (suficiente para uso com poucos requests)
+jobs_store: Dict[str, Dict[str, Any]] = {}
+
+
+def create_job(fonte: str) -> str:
+    """Cria um novo job e retorna o job_id."""
+    job_id = str(uuid.uuid4())[:8]
+    jobs_store[job_id] = {
+        "job_id": job_id,
+        "status": "processing",
+        "fonte": fonte,
+        "created_at": datetime.now().isoformat(),
+        "completed_at": None,
+        "result": None
+    }
+    # Limpar jobs antigos (manter apenas os últimos 50)
+    if len(jobs_store) > 50:
+        oldest_keys = sorted(jobs_store.keys(), key=lambda k: jobs_store[k]["created_at"])[:20]
+        for k in oldest_keys:
+            del jobs_store[k]
+    return job_id
+
+
+def complete_job(job_id: str, result: dict, erros: list = None):
+    """Marca um job como completo com o resultado."""
+    if job_id in jobs_store:
+        jobs_store[job_id]["status"] = "completed" if not erros else "partial"
+        jobs_store[job_id]["completed_at"] = datetime.now().isoformat()
+        jobs_store[job_id]["result"] = {
+            "status": "success" if not erros else "partial",
+            "fonte": jobs_store[job_id]["fonte"],
+            "data_coleta": datetime.now().isoformat(),
+            "dados": result,
+            "erros": erros or []
+        }
+
+
+def fail_job(job_id: str, error: str):
+    """Marca um job como falho."""
+    if job_id in jobs_store:
+        jobs_store[job_id]["status"] = "failed"
+        jobs_store[job_id]["completed_at"] = datetime.now().isoformat()
+        jobs_store[job_id]["result"] = {
+            "status": "error",
+            "fonte": jobs_store[job_id]["fonte"],
+            "data_coleta": datetime.now().isoformat(),
+            "dados": {},
+            "erros": [error]
+        }
 
 
 # ============================================================
@@ -1171,6 +1225,21 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
 
 
 # ============================================================
+# BACKGROUND TASK RUNNERS
+# ============================================================
+async def run_scrape_job(job_id: str, fonte: str, scrape_func, req):
+    """Executa um scraping em background e salva o resultado no job."""
+    try:
+        logger.info(f"[Job {job_id}] Iniciando scraping {fonte}...")
+        dados = await scrape_func(req)
+        complete_job(job_id, dados, dados.get("erros", []))
+        logger.info(f"[Job {job_id}] Scraping {fonte} conclu\u00eddo!")
+    except Exception as e:
+        logger.error(f"[Job {job_id}] Erro no scraping {fonte}: {e}")
+        fail_job(job_id, str(e))
+
+
+# ============================================================
 # ENDPOINTS
 # ============================================================
 @app.get("/health")
@@ -1178,26 +1247,63 @@ def health():
     return {
         "status": "ok",
         "service": "melissa-scraper-playwright",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "timestamp": datetime.now().isoformat(),
-        "playwright": True
+        "playwright": True,
+        "async_jobs": True
     }
 
 
 @app.get("/")
 def root():
     return {
-        "service": "Melissa Scraper API v3 (Playwright)",
-        "version": "3.0.0",
+        "service": "Melissa Scraper API v3.1 (Playwright + Async Jobs)",
+        "version": "3.1.0",
         "docs": "/docs",
         "health": "/health",
-        "endpoints": ["/scrape/classroom", "/scrape/superapp", "/scrape/superapp/conteudo", "/scrape/roteiro", "/scrape/all"]
+        "endpoints": [
+            "/scrape/classroom",
+            "/scrape/superapp",
+            "/scrape/superapp/conteudo",
+            "/scrape/roteiro",
+            "/scrape/all",
+            "/job/{job_id}"
+        ],
+        "usage": {
+            "sync": "POST /scrape/{fonte} - Retorna resultado diretamente (pode dar timeout em endpoints pesados)",
+            "async": "POST /scrape/{fonte}?async=true - Retorna job_id imediatamente, consulte GET /job/{job_id} para o resultado"
+        }
     }
 
 
-@app.post("/scrape/classroom", response_model=ScrapeResponse)
-async def endpoint_classroom(req: ScrapeRequest, authorization: str = Header(None)):
+# --- Endpoint de consulta de jobs ---
+@app.get("/job/{job_id}")
+def get_job(job_id: str, authorization: str = Header(None)):
     verificar_auth(authorization)
+    if job_id not in jobs_store:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} n\u00e3o encontrado")
+    job = jobs_store[job_id]
+    if job["status"] == "processing":
+        return {
+            "job_id": job_id,
+            "status": "processing",
+            "fonte": job["fonte"],
+            "created_at": job["created_at"],
+            "message": "Job ainda em processamento. Tente novamente em 10-30 segundos."
+        }
+    return job["result"]
+
+
+# --- Classroom ---
+@app.post("/scrape/classroom")
+async def endpoint_classroom(req: ScrapeRequest, background_tasks: BackgroundTasks, authorization: str = Header(None), async_mode: bool = False):
+    verificar_auth(authorization)
+    # Modo ass\u00edncrono: retorna job_id imediatamente
+    if async_mode or req.dict().get("async", False):
+        job_id = create_job("classroom")
+        background_tasks.add_task(run_scrape_job, job_id, "classroom", scrape_classroom_async, req)
+        return {"job_id": job_id, "status": "processing", "poll_url": f"/job/{job_id}"}
+    # Modo s\u00edncrono: retorna resultado diretamente
     logger.info(f"Scraping Classroom para {req.aluna}")
     dados = await scrape_classroom_async(req)
     return ScrapeResponse(
@@ -1209,9 +1315,14 @@ async def endpoint_classroom(req: ScrapeRequest, authorization: str = Header(Non
     )
 
 
-@app.post("/scrape/superapp", response_model=ScrapeResponse)
-async def endpoint_superapp(req: ScrapeRequest, authorization: str = Header(None)):
+# --- SuperApp ---
+@app.post("/scrape/superapp")
+async def endpoint_superapp(req: ScrapeRequest, background_tasks: BackgroundTasks, authorization: str = Header(None), async_mode: bool = False):
     verificar_auth(authorization)
+    if async_mode or req.dict().get("async", False):
+        job_id = create_job("superapp")
+        background_tasks.add_task(run_scrape_job, job_id, "superapp", scrape_superapp_async, req)
+        return {"job_id": job_id, "status": "processing", "poll_url": f"/job/{job_id}"}
     logger.info(f"Scraping SuperApp para {req.aluna}")
     dados = await scrape_superapp_async(req)
     return ScrapeResponse(
@@ -1223,10 +1334,15 @@ async def endpoint_superapp(req: ScrapeRequest, authorization: str = Header(None
     )
 
 
+# --- SuperApp Conte\u00fado ---
 @app.post("/scrape/superapp/conteudo")
-async def endpoint_superapp_conteudo(req: ConteudoRequest, authorization: str = Header(None)):
+async def endpoint_superapp_conteudo(req: ConteudoRequest, background_tasks: BackgroundTasks, authorization: str = Header(None), async_mode: bool = False):
     verificar_auth(authorization)
-    logger.info(f"Scraping Conteúdo de Aula - Matéria: {req.materia or 'LISTA'}")
+    if async_mode or req.dict().get("async", False):
+        job_id = create_job("superapp-conteudo")
+        background_tasks.add_task(run_scrape_job, job_id, "superapp-conteudo", scrape_superapp_conteudo_async, req)
+        return {"job_id": job_id, "status": "processing", "poll_url": f"/job/{job_id}"}
+    logger.info(f"Scraping Conte\u00fado de Aula - Mat\u00e9ria: {req.materia or 'LISTA'}")
     dados = await scrape_superapp_conteudo_async(req)
     return {
         "status": "success" if not dados.get("erros") else "partial",
@@ -1237,41 +1353,30 @@ async def endpoint_superapp_conteudo(req: ConteudoRequest, authorization: str = 
     }
 
 
-@app.post("/scrape/roteiro", response_model=ScrapeResponse)
-async def endpoint_roteiro(req: ScrapeRequest, authorization: str = Header(None)):
+# --- Roteiro ---
+@app.post("/scrape/roteiro")
+async def endpoint_roteiro(req: ScrapeRequest, background_tasks: BackgroundTasks, authorization: str = Header(None), async_mode: bool = False):
     verificar_auth(authorization)
-    logger.info("Scraping Roteiro de Estudos")
-    dados = await scrape_roteiro_async(req)
-    return ScrapeResponse(
-        status="success" if not dados.get("erros") else "partial",
-        fonte="roteiro",
-        data_coleta=datetime.now().isoformat(),
-        dados=dados,
-        erros=dados.get("erros", [])
-    )
+    # Roteiro SEMPRE usa modo ass\u00edncrono (demora mais que 30s)
+    job_id = create_job("roteiro")
+    background_tasks.add_task(run_scrape_job, job_id, "roteiro", scrape_roteiro_async, req)
+    return {"job_id": job_id, "status": "processing", "poll_url": f"/job/{job_id}"}
 
 
+# --- All ---
 @app.post("/scrape/all")
-async def endpoint_all(req: ScrapeRequest, authorization: str = Header(None)):
+async def endpoint_all(req: ScrapeRequest, background_tasks: BackgroundTasks, authorization: str = Header(None)):
     verificar_auth(authorization)
     logger.info(f"Scraping completo para {req.aluna}")
-
-    # Executar em paralelo
-    classroom_task = scrape_classroom_async(req)
-    superapp_task = scrape_superapp_async(req)
-    roteiro_task = scrape_roteiro_async(req)
-
-    classroom, superapp, roteiro = await asyncio.gather(
-        classroom_task, superapp_task, roteiro_task,
-        return_exceptions=True
-    )
-
+    # Sempre ass\u00edncrono para /all
+    job_ids = {}
+    for fonte, func in [("classroom", scrape_classroom_async), ("superapp", scrape_superapp_async), ("roteiro", scrape_roteiro_async)]:
+        job_id = create_job(fonte)
+        job_ids[fonte] = job_id
+        background_tasks.add_task(run_scrape_job, job_id, fonte, func, req)
     return {
-        "status": "success",
-        "data_coleta": datetime.now().isoformat(),
-        "classroom": classroom if not isinstance(classroom, Exception) else {"erros": [str(classroom)]},
-        "superapp": superapp if not isinstance(superapp, Exception) else {"erros": [str(superapp)]},
-        "roteiro": roteiro if not isinstance(roteiro, Exception) else {"erros": [str(roteiro)]}
+        "status": "processing",
+        "jobs": {fonte: {"job_id": jid, "poll_url": f"/job/{jid}"} for fonte, jid in job_ids.items()}
     }
 
 
