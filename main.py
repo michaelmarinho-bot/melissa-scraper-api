@@ -106,7 +106,7 @@ async def google_login(page, email: str, password: str, max_retries: int = 3):
             await email_input.wait_for(state="visible", timeout=10000)
             await email_input.fill(email)
             await page.wait_for_timeout(500)
-            await page.locator('#identifierNext button, #identifierNext').click()
+            await page.locator('#identifierNext button').click()
             await page.wait_for_timeout(4000)
 
             # Aguardar tela de senha (/challenge/pwd é NORMAL, não é CAPTCHA)
@@ -114,7 +114,7 @@ async def google_login(page, email: str, password: str, max_retries: int = 3):
             await password_input.wait_for(state="visible", timeout=15000)
             await password_input.fill(password)
             await page.wait_for_timeout(500)
-            await page.locator('#passwordNext button, #passwordNext').click()
+            await page.locator('#passwordNext button').click()
             await page.wait_for_timeout(5000)
 
             # Verificar se login foi bem-sucedido
