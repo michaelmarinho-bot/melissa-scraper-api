@@ -614,25 +614,36 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
     password = req.password or MELISSA_PASSWORD
 
     async with async_playwright() as p:
+        # OTIMIZADO para 512MB RAM: headless=True + bloquear recursos pesados
         browser = await p.chromium.launch(
-            headless=False,
+            headless=True,
             args=[
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
                 "--disable-blink-features=AutomationControlled",
-                "--window-size=1280,800",
+                "--single-process",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-default-apps",
+                "--no-first-run",
+                "--window-size=800,600",
             ]
         )
 
         context = await browser.new_context(
-            viewport={"width": 1280, "height": 800},
+            viewport={"width": 800, "height": 600},
             user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             locale="pt-BR"
         )
 
         page = await context.new_page()
+
+        # Bloquear imagens, CSS e fontes para economizar memória
+        await page.route("**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,eot}", lambda route: route.abort())
+        await page.route("**/fonts.googleapis.com/**", lambda route: route.abort())
+        await page.route("**/fonts.gstatic.com/**", lambda route: route.abort())
 
         try:
             # 1. Login no Google PRIMEIRO (mesmo método do Classroom)
@@ -655,20 +666,10 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
             # 3. Verificar se estamos no Roteiro
             current_url = page.url
             logger.info(f"URL atual: {current_url}")
-            page_title = await page.title()
-            logger.info(f"Título da página: {page_title}")
 
             # Verificar se carregou
             page_text = await page.evaluate("document.body.innerText")
             logger.info(f"Roteiro: {len(page_text)} chars na página")
-            if len(page_text) < 50:
-                logger.warning(f"Página com pouco conteúdo. Texto: {page_text[:200]}")
-                # Tentar screenshot para debug
-                try:
-                    await page.screenshot(path="/tmp/roteiro_debug.png")
-                    logger.info("Screenshot salvo em /tmp/roteiro_debug.png")
-                except Exception:
-                    pass
 
             # 4. Coletar dados de cada aba: AD, AO, Inglês
             abas_config = [
@@ -690,13 +691,7 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
                         logger.info(f"Clicou na aba {aba_nome}")
                         await page.wait_for_timeout(3000)
 
-                        # Aguardar itens carregarem
-                        try:
-                            await page.wait_for_selector('div[role="button"]', timeout=15000)
-                        except Exception:
-                            await page.wait_for_timeout(5000)
-
-                        # Coletar todos os itens da lista via JavaScript (mais rápido)
+                        # Coletar todos os itens da lista via JavaScript (rápido e leve)
                         items_data = await page.evaluate("""
                             () => {
                                 const items = document.querySelectorAll('div[role="button"]');
@@ -720,54 +715,6 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
                                 prova["data"] = partes[2].strip() if len(partes) > 2 else ""
                                 prova["serie"] = partes[0].strip() if len(partes) > 0 else ""
                             provas_aba.append(prova)
-
-                        # Agora clicar em cada item para obter detalhes
-                        items = page.locator('div[role="button"]')
-                        item_count = await items.count()
-                        for i in range(min(item_count, len(provas_aba))):
-                            try:
-                                await items.nth(i).click()
-                                await page.wait_for_timeout(2000)
-
-                                detalhe_text = await page.evaluate("document.body.innerText")
-                                provas_aba[i]["detalhes_raw"] = detalhe_text[:5000]
-
-                                # Extrair campos específicos
-                                linhas = detalhe_text.split("\n")
-                                for idx, linha in enumerate(linhas):
-                                    linha_strip = linha.strip()
-                                    if "Conteúdos e Direcionamentos" in linha_strip:
-                                        if idx + 1 < len(linhas):
-                                            provas_aba[i]["conteudos"] = linhas[idx + 1].strip()
-                                    elif "Páginas" in linha_strip and "Materiais" in linha_strip:
-                                        if idx + 1 < len(linhas):
-                                            provas_aba[i]["paginas_materiais"] = linhas[idx + 1].strip()
-                                    elif "Dicas de estudo" in linha_strip:
-                                        if idx + 1 < len(linhas):
-                                            provas_aba[i]["dicas_estudo"] = linhas[idx + 1].strip()
-
-                                # Voltar para a lista
-                                back_btn = page.locator('button:has-text("Voltar")')
-                                if await back_btn.count() > 0:
-                                    await back_btn.first.click()
-                                    await page.wait_for_timeout(2000)
-                                    try:
-                                        await page.wait_for_selector('div[role="button"]', timeout=10000)
-                                    except Exception:
-                                        await page.wait_for_timeout(3000)
-                                else:
-                                    await page.go_back()
-                                    await page.wait_for_timeout(3000)
-
-                            except Exception as e:
-                                logger.warning(f"Erro ao acessar detalhes item {i} da aba {aba_nome}: {e}")
-                                try:
-                                    back_btn = page.locator('button:has-text("Voltar")')
-                                    if await back_btn.count() > 0:
-                                        await back_btn.first.click()
-                                        await page.wait_for_timeout(2000)
-                                except Exception:
-                                    pass
 
                         dados[aba_chave] = provas_aba
                         logger.info(f"Aba {aba_nome}: {len(provas_aba)} provas coletadas")
