@@ -597,9 +597,8 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
     - Provas AO (Avaliação Objetiva)
     - Provas AD (Avaliação Dissertativa)
     - Provas de Inglês
-    Usa o mesmo método de login do Classroom: faz Google Login PRIMEIRO,
-    depois navega para o Roteiro já autenticado.
-    Aguarda o Glide App carregar antes de coletar dados.
+    Navega DIRETO para o Roteiro e faz login pelo botão "Continuar com Google"
+    que aparece na própria página do Glide App.
     """
     from playwright.async_api import async_playwright
 
@@ -614,8 +613,7 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
     password = req.password or MELISSA_PASSWORD
 
     async with async_playwright() as p:
-        # headless=False + Xvfb = browser real com display virtual
-        # Necessário para Google Login funcionar sem CAPTCHA
+        # headless=False + Xvfb para evitar CAPTCHA do Google
         browser = await p.chromium.launch(
             headless=False,
             args=[
@@ -641,38 +639,72 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
 
         page = await context.new_page()
 
-        # Bloquear imagens, fontes e CSS para economizar memória
+        # Bloquear imagens e fontes para economizar memória
         await page.route("**/*.{png,jpg,jpeg,gif,svg,webp,woff,woff2,ttf,eot}", lambda route: route.abort())
         await page.route("**/fonts.googleapis.com/**", lambda route: route.abort())
         await page.route("**/fonts.gstatic.com/**", lambda route: route.abort())
 
         try:
-            # 1. Login no Google PRIMEIRO (mesmo método do Classroom)
-            logger.info("Iniciando login no Google (método Classroom)...")
-            login_ok = await google_login(page, email, password)
-
-            if not login_ok:
-                dados["erros"].append("Falha no login Google. Verifique credenciais ou desafio de segurança.")
-                await browser.close()
-                return dados
-
-            # 2. Navegar para o Roteiro de Estudos já autenticado
-            # NOTA: Glide App faz polling contínuo, networkidle NUNCA completa e causa OOM
-            # Por isso usamos domcontentloaded + espera fixa
-            logger.info("Navegando para o Roteiro de Estudos (já autenticado)...")
+            # 1. Navegar DIRETO para o Roteiro de Estudos
+            logger.info("Navegando direto para o Roteiro de Estudos...")
             await page.goto("https://roteiro.jardim.li/dl/d0a5f4", wait_until="domcontentloaded", timeout=30000)
-            logger.info("DOM carregado, aguardando Glide App renderizar...")
-            await page.wait_for_timeout(10000)
+            await page.wait_for_timeout(5000)
 
-            # 3. Verificar se estamos no Roteiro
-            current_url = page.url
-            logger.info(f"URL atual: {current_url}")
+            # 2. Clicar em "Continuar com o Google" na página do Roteiro
+            logger.info("Procurando botão 'Continuar com o Google'...")
+            google_btn = page.locator('button:has-text("Google"), a:has-text("Google"), div:has-text("Continuar com o Google"):visible')
+            btn_count = await google_btn.count()
+            logger.info(f"Botões Google encontrados: {btn_count}")
+
+            if btn_count > 0:
+                await google_btn.first.click()
+                logger.info("Clicou em 'Continuar com o Google'")
+                await page.wait_for_timeout(5000)
+
+                # 3. Preencher email no formulário do Google
+                current_url = page.url
+                logger.info(f"URL após clicar Google: {current_url}")
+
+                # Verificar se abriu popup ou redirecionou
+                pages = context.pages
+                login_page = pages[-1] if len(pages) > 1 else page
+                logger.info(f"Páginas abertas: {len(pages)}")
+
+                # Inserir email
+                email_input = login_page.locator('input[type="email"]')
+                await email_input.wait_for(state="visible", timeout=10000)
+                await email_input.fill(email)
+                await login_page.wait_for_timeout(500)
+                await login_page.locator('#identifierNext button').click()
+                logger.info("Email inserido, aguardando tela de senha...")
+                await login_page.wait_for_timeout(4000)
+
+                # Inserir senha
+                password_input = login_page.locator('input[type="password"]')
+                await password_input.wait_for(state="visible", timeout=15000)
+                await password_input.fill(password)
+                await login_page.wait_for_timeout(500)
+                await login_page.locator('#passwordNext button').click()
+                logger.info("Senha inserida, aguardando login completar...")
+                await login_page.wait_for_timeout(5000)
+
+                # Verificar se voltou para o Roteiro
+                current_url = page.url
+                logger.info(f"URL após login: {current_url}")
+            else:
+                # Talvez já esteja logado, verificar conteúdo
+                page_text = await page.evaluate("document.body.innerText")
+                logger.info(f"Sem botão Google. Texto da página: {page_text[:200]}")
+
+            # 4. Aguardar Glide App carregar após login
+            logger.info("Aguardando Glide App renderizar após login...")
+            await page.wait_for_timeout(10000)
 
             # Verificar se carregou
             page_text = await page.evaluate("document.body.innerText")
             logger.info(f"Roteiro: {len(page_text)} chars na página")
 
-            # 4. Coletar dados de cada aba: AD, AO, Inglês
+            # 5. Coletar dados de cada aba: AD, AO, Inglês
             abas_config = [
                 {"nome": "AD", "chave": "provas_ad"},
                 {"nome": "AO", "chave": "provas_ao"},
@@ -692,7 +724,7 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
                         logger.info(f"Clicou na aba {aba_nome}")
                         await page.wait_for_timeout(3000)
 
-                        # Coletar todos os itens da lista via JavaScript (rápido e leve)
+                        # Coletar todos os itens da lista via JavaScript
                         items_data = await page.evaluate("""
                             () => {
                                 const items = document.querySelectorAll('div[role="button"]');
@@ -709,7 +741,6 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
                                 "item_lista": item_text,
                                 "indice": i
                             }
-                            # Parsear texto do item (formato: "AD · 8º ANO\nMateria\nDD/MM/YYYY")
                             partes = item_text.split("\n")
                             if len(partes) >= 2:
                                 prova["materia"] = partes[1].strip() if len(partes) > 1 else ""
