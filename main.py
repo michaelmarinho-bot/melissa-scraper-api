@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Melissa Scraper API - Versão Lite (sem Playwright)
-Usa requests + BeautifulSoup + OpenAI para coleta de dados.
-Deploy gratuito no Render.com sem Docker.
+Melissa Scraper API v3.0 — Playwright Edition
+Usa Playwright (headless Chromium) para navegação real nos portais escolares.
+Deploy no Render.com via Docker.
 
 Endpoints:
-  POST /scrape/superapp   - Coleta dados do SuperApp Layers via API/session
-  POST /scrape/classroom  - Coleta tarefas do Google Classroom via API
-  POST /scrape/roteiro    - Coleta dados do Roteiro de Estudos
+  POST /scrape/classroom  - Coleta turmas, atividades e materiais do Google Classroom
+  POST /scrape/superapp   - Coleta dados do SuperApp Layers (notas, conteúdos, registros)
+  POST /scrape/roteiro    - Coleta dados do Roteiro de Estudos (provas AO/AD)
   POST /scrape/all        - Executa todos de uma vez
   GET  /health            - Health check
 """
@@ -17,26 +17,27 @@ import json
 import re
 import asyncio
 import logging
-from datetime import datetime
-from typing import Optional
+import traceback
+from datetime import datetime, timedelta
+from typing import Optional, List, Dict, Any
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, BackgroundTasks
 from pydantic import BaseModel
-import requests as http_requests
-from bs4 import BeautifulSoup
 
 # ============================================================
 # CONFIGURAÇÃO
 # ============================================================
 API_SECRET = os.environ.get("MELISSA_API_SECRET", "") or os.environ.get("MELISSA_API_KEY", "trocar-por-uma-chave-segura")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
-SUPERAPP_EMAIL = os.environ.get("SUPERAPP_EMAIL", "")
-SUPERAPP_PASSWORD = os.environ.get("SUPERAPP_PASSWORD", "")
-CLASSROOM_EMAIL = os.environ.get("CLASSROOM_EMAIL", "")
-CLASSROOM_PASSWORD = os.environ.get("CLASSROOM_PASSWORD", "")
 
-logging.basicConfig(level=logging.INFO)
+# Credenciais da Melissa (conta escolar)
+MELISSA_EMAIL = os.environ.get("MELISSA_EMAIL", "melissa.marinho@liceujardim.g12.br")
+MELISSA_PASSWORD = os.environ.get("MELISSA_PASSWORD", "elvis!!1")
+
+# Credenciais do SuperApp (pode ser diferente)
+SUPERAPP_EMAIL = os.environ.get("SUPERAPP_EMAIL", MELISSA_EMAIL)
+SUPERAPP_PASSWORD = os.environ.get("SUPERAPP_PASSWORD", MELISSA_PASSWORD)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("melissa-scraper")
 
 
@@ -49,7 +50,6 @@ class ScrapeRequest(BaseModel):
     aluna: str = "Melissa Majado Marinho"
     turma: str = "8E"
     data_referencia: str = ""
-    google_token: str = ""  # Token OAuth do Google (passado pelo n8n)
 
 
 class ScrapeResponse(BaseModel):
@@ -64,397 +64,661 @@ class ScrapeResponse(BaseModel):
 # FASTAPI APP
 # ============================================================
 app = FastAPI(
-    title="Melissa Scraper API Lite",
-    description="API leve de scraping para a Agente Melissa - sem Playwright",
-    version="2.0.0"
+    title="Melissa Scraper API",
+    description="API de scraping com Playwright para a Agente Melissa",
+    version="3.0.0"
 )
 
 
 def verificar_auth(authorization: str = Header(None)):
+    if not API_SECRET:
+        return  # Se não configurou secret, aceita tudo
     if not authorization or authorization.replace("Bearer ", "") != API_SECRET:
         raise HTTPException(status_code=401, detail="Chave de API inválida")
 
 
-def chamar_openai(system_prompt: str, user_prompt: str, model: str = "gpt-4.1-mini") -> str:
-    """Chama a OpenAI API para processar/interpretar dados."""
-    if not OPENAI_API_KEY:
-        return '{"erro": "OPENAI_API_KEY não configurada"}'
-    
-    try:
-        resp = http_requests.post(
-            f"{OPENAI_BASE_URL}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                "temperature": 0.1,
-                "max_tokens": 4000
-            },
-            timeout=60
+# ============================================================
+# PLAYWRIGHT - LOGIN GOOGLE
+# ============================================================
+async def google_login(page, email: str, password: str, max_retries: int = 3):
+    """
+    Faz login no Google com email e senha.
+    Funciona para Classroom, Drive, e qualquer serviço Google.
+    IMPORTANTE: Requer Xvfb (display virtual) para evitar CAPTCHA.
+    A URL /challenge/pwd é o fluxo NORMAL de senha, NÃO é CAPTCHA.
+    """
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Tentativa de login Google {attempt + 1}/{max_retries}...")
+
+            # Navegar para o login do Google
+            await page.goto("https://accounts.google.com/signin", wait_until="networkidle", timeout=30000)
+            await page.wait_for_timeout(3000)
+
+            # Verificar se já está logado
+            current_url = page.url
+            if "myaccount.google.com" in current_url or "classroom.google.com" in current_url:
+                logger.info("Já está logado!")
+                return True
+
+            # Inserir email
+            email_input = page.locator('input[type="email"]')
+            await email_input.wait_for(state="visible", timeout=10000)
+            await email_input.fill(email)
+            await page.wait_for_timeout(500)
+            await page.locator('#identifierNext button, #identifierNext').click()
+            await page.wait_for_timeout(4000)
+
+            # Aguardar tela de senha (/challenge/pwd é NORMAL, não é CAPTCHA)
+            password_input = page.locator('input[type="password"]')
+            await password_input.wait_for(state="visible", timeout=15000)
+            await password_input.fill(password)
+            await page.wait_for_timeout(500)
+            await page.locator('#passwordNext button, #passwordNext').click()
+            await page.wait_for_timeout(5000)
+
+            # Verificar se login foi bem-sucedido
+            current_url = page.url
+            if "accounts.google.com" not in current_url:
+                logger.info(f"Login Google bem-sucedido! URL: {current_url}")
+                return True
+
+            # Verificar CAPTCHA real (não confundir com /challenge/pwd)
+            page_content = await page.content()
+            has_visible_captcha = await page.locator('iframe[title*="recaptcha"]:visible').count() > 0
+            if has_visible_captcha:
+                logger.error("CAPTCHA visível detectado! Verifique se Xvfb está ativo.")
+                return False
+
+            # Pode ter redirecionamento extra, esperar mais
+            await page.wait_for_timeout(5000)
+            current_url = page.url
+            if "accounts.google.com" not in current_url:
+                logger.info(f"Login Google bem-sucedido (após redirect)! URL: {current_url}")
+                return True
+
+            logger.warning(f"Login pode ter falhado. URL: {current_url}")
+
+        except Exception as e:
+            logger.error(f"Erro no login (tentativa {attempt + 1}): {e}")
+            if attempt < max_retries - 1:
+                await page.wait_for_timeout(3000)
+
+    return False
+
+
+# ============================================================
+# SCRAPING - GOOGLE CLASSROOM
+# ============================================================
+async def scrape_classroom_async(req: ScrapeRequest) -> dict:
+    """
+    Navega no Google Classroom via Playwright e coleta:
+    - Lista de turmas do 8E
+    - Atividades de cada turma (título, data, descrição, status)
+    - Materiais e arquivos anexados (com links do Drive)
+    """
+    from playwright.async_api import async_playwright
+
+    dados = {
+        "turmas": [],
+        "atividades": [],
+        "materiais": [],
+        "arquivos_para_download": [],
+        "erros": []
+    }
+
+    email = req.email or MELISSA_EMAIL
+    password = req.password or MELISSA_PASSWORD
+
+    async with async_playwright() as p:
+        # headless=False + Xvfb = browser real com display virtual
+        # Isso evita detecção de bot e CAPTCHA do Google
+        browser = await p.chromium.launch(
+            headless=False,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-blink-features=AutomationControlled",
+                "--window-size=1280,800",
+            ]
         )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
-    except Exception as e:
-        logger.error(f"Erro OpenAI: {e}")
-        return json.dumps({"erro": str(e)})
+
+        context = await browser.new_context(
+            viewport={"width": 1280, "height": 800},
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            locale="pt-BR"
+        )
+
+        page = await context.new_page()
+
+        try:
+            # 1. Login no Google
+            logger.info("Iniciando login no Google...")
+            login_ok = await google_login(page, email, password)
+
+            if not login_ok:
+                dados["erros"].append("Falha no login Google. Verifique credenciais ou desafio de segurança.")
+                await browser.close()
+                return dados
+
+            # 2. Navegar para o Classroom
+            logger.info("Navegando para o Google Classroom...")
+            await page.goto("https://classroom.google.com/", wait_until="networkidle", timeout=30000)
+            await page.wait_for_timeout(5000)
+
+            # 3. Verificar se estamos no Classroom
+            current_url = page.url
+            if "classroom.google.com" not in current_url:
+                dados["erros"].append(f"Não conseguiu acessar o Classroom. URL atual: {current_url}")
+                await browser.close()
+                return dados
+
+            # 4. Coletar lista de turmas
+            logger.info("Coletando lista de turmas...")
+            await page.wait_for_timeout(3000)
+
+            # Rolar para carregar todas as turmas
+            for _ in range(3):
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await page.wait_for_timeout(1000)
+
+            # Extrair turmas via DOM
+            turmas_raw = await page.evaluate("""
+                () => {
+                    const turmas = [];
+                    // Cards de turma no Classroom
+                    const cards = document.querySelectorAll('[data-course-id], .gHz6xd, .YVvGBb');
+                    cards.forEach(card => {
+                        const nome = card.querySelector('.YVvGBb, .R4EiSb, h2')?.textContent?.trim() || '';
+                        const secao = card.querySelector('.tL9Q4c, .Mdb1Xb')?.textContent?.trim() || '';
+                        const link = card.querySelector('a[href*="/c/"]')?.href || '';
+                        const courseId = card.getAttribute('data-course-id') || '';
+                        if (nome) {
+                            turmas.push({ nome, secao, link, courseId });
+                        }
+                    });
+
+                    // Fallback: pegar todos os links de turmas
+                    if (turmas.length === 0) {
+                        document.querySelectorAll('a[href*="/c/"]').forEach(a => {
+                            const nome = a.textContent?.trim() || '';
+                            if (nome && nome.length > 2) {
+                                turmas.push({ nome, secao: '', link: a.href, courseId: '' });
+                            }
+                        });
+                    }
+
+                    return turmas;
+                }
+            """)
+
+            # Filtrar turmas do 8E
+            for turma in turmas_raw:
+                dados["turmas"].append(turma)
+                logger.info(f"Turma encontrada: {turma['nome']}")
+
+            if not dados["turmas"]:
+                # Fallback: extrair texto da página
+                page_text = await page.evaluate("document.body.innerText")
+                dados["erros"].append(f"Nenhuma turma encontrada via DOM. Texto da página (primeiros 2000 chars): {page_text[:2000]}")
+                await browser.close()
+                return dados
+
+            # 5. Para cada turma, acessar atividades
+            for turma in dados["turmas"]:
+                turma_nome = turma["nome"]
+                turma_link = turma.get("link", "")
+
+                if not turma_link:
+                    dados["erros"].append(f"Turma '{turma_nome}': sem link de acesso")
+                    continue
+
+                try:
+                    logger.info(f"Acessando turma: {turma_nome}...")
+
+                    # Navegar para a turma
+                    await page.goto(turma_link, wait_until="networkidle", timeout=30000)
+                    await page.wait_for_timeout(3000)
+
+                    # Clicar na aba "Atividades" (Classwork)
+                    try:
+                        atividades_tab = page.locator('a:has-text("Atividades"), a:has-text("Classwork"), a[href*="/w/"]')
+                        if await atividades_tab.count() > 0:
+                            await atividades_tab.first.click()
+                            await page.wait_for_timeout(3000)
+                    except Exception as e:
+                        logger.warning(f"Não encontrou aba Atividades: {e}")
+                        # Tentar navegar direto
+                        course_id_match = re.search(r'/c/(\w+)', turma_link)
+                        if course_id_match:
+                            await page.goto(f"https://classroom.google.com/w/{course_id_match.group(1)}/t/all", wait_until="networkidle", timeout=30000)
+                            await page.wait_for_timeout(3000)
+
+                    # Rolar para carregar todas as atividades
+                    for _ in range(5):
+                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        await page.wait_for_timeout(1000)
+
+                    # Extrair atividades
+                    atividades_raw = await page.evaluate("""
+                        () => {
+                            const items = [];
+                            // Seletores do Classroom para atividades
+                            const posts = document.querySelectorAll('.asQXV, [data-coursework-id], [data-stream-item-id]');
+                            posts.forEach(post => {
+                                const titulo = post.querySelector('.YVvGBb, .tL9Q4c, .onkcGd')?.textContent?.trim() || '';
+                                const descricao = post.querySelector('.oKOVhd, .CkGfWc')?.textContent?.trim() || '';
+                                const data = post.querySelector('.EhRlC, .lYVkk')?.textContent?.trim() || '';
+                                const link = post.querySelector('a[href*="/c/"]')?.href || '';
+                                const tipo = post.querySelector('.YVvGBb')?.closest('[data-item-type]')?.getAttribute('data-item-type') || '';
+
+                                if (titulo) {
+                                    items.push({ titulo, descricao, data, link, tipo, turma: '' });
+                                }
+                            });
+
+                            // Fallback: pegar texto geral da página
+                            if (items.length === 0) {
+                                const allText = document.body.innerText;
+                                items.push({ titulo: 'FALLBACK_TEXT', descricao: allText.substring(0, 5000), data: '', link: '', tipo: 'fallback', turma: '' });
+                            }
+
+                            return items;
+                        }
+                    """)
+
+                    for ativ in atividades_raw:
+                        ativ["turma"] = turma_nome
+                        dados["atividades"].append(ativ)
+
+                    logger.info(f"Turma '{turma_nome}': {len(atividades_raw)} atividades encontradas")
+
+                    # 6. Clicar em cada atividade para ver detalhes e arquivos
+                    atividade_links = await page.evaluate("""
+                        () => {
+                            const links = [];
+                            document.querySelectorAll('a[href*="/c/"][href*="/a/"], a[href*="/c/"][href*="/m/"]').forEach(a => {
+                                const href = a.href;
+                                if (href && !links.includes(href)) {
+                                    links.push(href);
+                                }
+                            });
+                            return links;
+                        }
+                    """)
+
+                    for ativ_link in atividade_links[:20]:  # Limitar a 20 por turma
+                        try:
+                            await page.goto(ativ_link, wait_until="networkidle", timeout=20000)
+                            await page.wait_for_timeout(2000)
+
+                            # Extrair detalhes da atividade
+                            detalhes = await page.evaluate("""
+                                () => {
+                                    const titulo = document.querySelector('.YVvGBb, h1, .onkcGd')?.textContent?.trim() || '';
+                                    const descricao = document.querySelector('.oKOVhd, .CkGfWc, [data-region="instructions"]')?.textContent?.trim() || '';
+                                    const dataEntrega = document.querySelector('.EhRlC, .lYVkk, [data-region="due-date"]')?.textContent?.trim() || '';
+
+                                    // Extrair arquivos/materiais
+                                    const arquivos = [];
+                                    document.querySelectorAll('a[href*="drive.google.com"], a[href*="docs.google.com"], a[href*="slides.google.com"]').forEach(a => {
+                                        const nome = a.textContent?.trim() || '';
+                                        const url = a.href || '';
+                                        if (url) {
+                                            // Extrair file ID do Google Drive
+                                            const match = url.match(/\/d\/([a-zA-Z0-9_-]+)/);
+                                            const fileId = match ? match[1] : '';
+                                            arquivos.push({ nome, url, fileId });
+                                        }
+                                    });
+
+                                    // Também pegar imagens e outros anexos
+                                    document.querySelectorAll('img[src*="googleusercontent"], img[src*="drive.google"]').forEach(img => {
+                                        arquivos.push({ nome: img.alt || 'imagem', url: img.src, fileId: '' });
+                                    });
+
+                                    return { titulo, descricao, dataEntrega, arquivos };
+                                }
+                            """)
+
+                            if detalhes["arquivos"]:
+                                for arq in detalhes["arquivos"]:
+                                    arq["turma"] = turma_nome
+                                    arq["atividade"] = detalhes["titulo"]
+                                    dados["arquivos_para_download"].append(arq)
+
+                            # Atualizar a atividade com detalhes
+                            dados["materiais"].append({
+                                "turma": turma_nome,
+                                "titulo": detalhes["titulo"],
+                                "descricao": detalhes["descricao"],
+                                "dataEntrega": detalhes["dataEntrega"],
+                                "arquivos": detalhes["arquivos"],
+                                "link": ativ_link
+                            })
+
+                        except Exception as e:
+                            logger.warning(f"Erro ao acessar atividade {ativ_link}: {e}")
+                            dados["erros"].append(f"Atividade {ativ_link}: {str(e)}")
+
+                except Exception as e:
+                    logger.error(f"Erro na turma '{turma_nome}': {e}")
+                    dados["erros"].append(f"Turma '{turma_nome}': {str(e)}")
+
+        except Exception as e:
+            logger.error(f"Erro geral no Classroom: {e}\n{traceback.format_exc()}")
+            dados["erros"].append(f"Erro geral: {str(e)}")
+
+        finally:
+            await browser.close()
+
+    # Resumo
+    dados["resumo"] = {
+        "total_turmas": len(dados["turmas"]),
+        "total_atividades": len(dados["atividades"]),
+        "total_materiais": len(dados["materiais"]),
+        "total_arquivos": len(dados["arquivos_para_download"]),
+        "total_erros": len(dados["erros"])
+    }
+
+    return dados
 
 
 # ============================================================
 # SCRAPING - SUPERAPP LAYERS
 # ============================================================
-def scrape_superapp(req: ScrapeRequest) -> dict:
+async def scrape_superapp_async(req: ScrapeRequest) -> dict:
     """
-    Coleta dados do SuperApp Layers usando requests + session.
-    Tenta login via formulário e extrai dados das páginas.
-    Se falhar, usa OpenAI para sugerir abordagem alternativa.
+    Navega no SuperApp Layers via Playwright e coleta:
+    - Conteúdo de Aula (via Sophia iframe)
+    - Notas Acadêmicas
+    - Registros Acadêmicos
     """
-    dados = {"conteudos": [], "notas": [], "registros": [], "erros": []}
+    from playwright.async_api import async_playwright
+
+    dados = {
+        "conteudos": [],
+        "notas": [],
+        "registros": [],
+        "frequencia": [],
+        "erros": []
+    }
+
     email = req.email or SUPERAPP_EMAIL
     password = req.password or SUPERAPP_PASSWORD
-    
-    if not email or not password:
-        dados["erros"].append("Credenciais do SuperApp não configuradas. Configure SUPERAPP_EMAIL e SUPERAPP_PASSWORD.")
-        return dados
-    
-    session = http_requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    })
-    
-    try:
-        # Tentar acessar a página de login
-        logger.info("Acessando SuperApp Layers...")
-        login_page = session.get("https://app.layers.education", timeout=15)
-        
-        # Tentar encontrar API de login
-        # Layers geralmente usa uma API REST para autenticação
-        login_endpoints = [
-            "https://app.layers.education/api/auth/login",
-            "https://app.layers.education/api/v1/auth/login",
-            "https://api.layers.education/v1/auth/login",
-            "https://app.layers.education/auth/login",
-        ]
-        
-        login_success = False
-        for endpoint in login_endpoints:
-            try:
-                resp = session.post(endpoint, json={
-                    "email": email,
-                    "password": password
-                }, timeout=15)
-                
-                if resp.status_code in [200, 201]:
-                    login_data = resp.json()
-                    logger.info(f"Login bem-sucedido via {endpoint}")
-                    
-                    # Extrair token se disponível
-                    token = login_data.get("token") or login_data.get("access_token") or login_data.get("data", {}).get("token", "")
-                    if token:
-                        session.headers["Authorization"] = f"Bearer {token}"
-                    
-                    login_success = True
-                    dados["login"] = "success"
-                    break
-                    
-            except Exception as e:
-                continue
-        
-        if not login_success:
-            # Tentar login via formulário HTML
-            try:
-                soup = BeautifulSoup(login_page.text, "html.parser")
-                form = soup.find("form")
-                if form:
-                    action = form.get("action", "")
-                    resp = session.post(
-                        action if action.startswith("http") else f"https://app.layers.education{action}",
-                        data={"email": email, "password": password},
-                        timeout=15
-                    )
-                    if resp.status_code in [200, 201, 302]:
-                        login_success = True
-                        dados["login"] = "success_form"
-            except Exception as e:
-                dados["erros"].append(f"Login form: {str(e)}")
-        
-        if login_success:
-            # Tentar acessar páginas de dados
-            paginas = {
-                "conteudos": [
-                    "https://app.layers.education/api/conteudo-de-aula",
-                    "https://app.layers.education/conteudo-de-aula",
-                ],
-                "notas": [
-                    "https://app.layers.education/api/notas-academicas",
-                    "https://app.layers.education/notas-academicas",
-                ],
-                "registros": [
-                    "https://app.layers.education/api/registros-academicos",
-                    "https://app.layers.education/registros-academicos",
-                ]
-            }
-            
-            for tipo, urls in paginas.items():
-                for url in urls:
-                    try:
-                        resp = session.get(url, timeout=15)
-                        if resp.status_code == 200:
-                            # Tentar parsear como JSON
-                            try:
-                                dados[tipo] = resp.json()
-                                break
-                            except:
-                                # Parsear como HTML
-                                soup = BeautifulSoup(resp.text, "html.parser")
-                                
-                                # Extrair tabelas
-                                tables = soup.find_all("table")
-                                if tables:
-                                    for table in tables:
-                                        rows = []
-                                        for tr in table.find_all("tr"):
-                                            cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
-                                            if cells:
-                                                rows.append(cells)
-                                        dados[tipo].extend(rows)
-                                    break
-                                else:
-                                    # Extrair texto geral
-                                    text = soup.get_text(separator="\n", strip=True)
-                                    if len(text) > 50:
-                                        dados[tipo] = [{"texto_raw": text[:5000]}]
-                                        break
-                    except Exception as e:
-                        continue
-        else:
-            dados["erros"].append("Não foi possível fazer login no SuperApp. Verifique credenciais.")
-            
-            # Usar OpenAI para sugerir abordagem
-            ai_resp = chamar_openai(
-                "Você é um especialista em web scraping e APIs educacionais.",
-                f"O login no SuperApp Layers (layers.education) falhou com email={email}. "
-                "Sugira abordagens alternativas para extrair dados de notas, conteúdos e registros acadêmicos. "
-                "Considere: APIs públicas do Layers, integrações OAuth, ou métodos alternativos."
-            )
-            dados["sugestao_ai"] = ai_resp
-    
-    except Exception as e:
-        dados["erros"].append(f"Erro geral SuperApp: {str(e)}")
-    
-    return dados
 
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=False,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-blink-features=AutomationControlled",
+                "--window-size=1280,800",
+            ]
+        )
 
-# ============================================================
-# SCRAPING - GOOGLE CLASSROOM (via API)
-# ============================================================
-def scrape_classroom(req: ScrapeRequest) -> dict:
-    """
-    Coleta dados do Google Classroom usando a API oficial do Google.
-    Requer um token OAuth passado pelo n8n (que já tem credenciais Google).
-    """
-    dados = {"turmas": [], "tarefas": [], "erros": []}
-    
-    google_token = req.google_token
-    
-    if not google_token:
-        dados["erros"].append(
-            "Token Google OAuth não fornecido. "
-            "O n8n deve passar o token via campo 'google_token'. "
-            "No n8n, use o nó 'Google Classroom' ou extraia o token das credenciais Google."
+        context = await browser.new_context(
+            viewport={"width": 1280, "height": 800},
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            locale="pt-BR"
         )
-        
-        # Sugestão alternativa via OpenAI
-        ai_resp = chamar_openai(
-            "Você é um especialista em Google APIs e n8n.",
-            "Preciso acessar o Google Classroom para extrair tarefas de uma aluna. "
-            "O n8n já tem credenciais Google OAuth configuradas. "
-            "Como posso extrair o access_token das credenciais do n8n e passá-lo para uma API externa? "
-            "Ou existe uma forma melhor de usar a API do Google Classroom diretamente no n8n?"
-        )
-        dados["sugestao_ai"] = ai_resp
-        return dados
-    
-    headers = {"Authorization": f"Bearer {google_token}"}
-    base_url = "https://classroom.googleapis.com/v1"
-    
-    try:
-        # 1. Listar turmas
-        logger.info("Listando turmas do Google Classroom...")
-        resp = http_requests.get(f"{base_url}/courses", headers=headers, timeout=15,
-                                 params={"courseStates": "ACTIVE"})
-        
-        if resp.status_code == 200:
-            courses = resp.json().get("courses", [])
-            dados["turmas"] = [{"id": c["id"], "nome": c.get("name", ""), "secao": c.get("section", "")} for c in courses]
-            
-            # 2. Para cada turma, listar tarefas
-            for course in courses:
-                course_id = course["id"]
-                course_name = course.get("name", "")
-                
+
+        page = await context.new_page()
+
+        try:
+            # 1. Login no SuperApp
+            logger.info("Acessando SuperApp Layers...")
+            await page.goto("https://liceu-jardim.layers.education/@liceu-jardim/", wait_until="networkidle", timeout=30000)
+            await page.wait_for_timeout(3000)
+
+            # Verificar se precisa fazer login
+            page_text = await page.evaluate("document.body.innerText")
+            if "Entrar" in page_text or "Login" in page_text or "login" in page.url:
+                logger.info("Fazendo login no SuperApp...")
+
+                # Clicar em Entrar
                 try:
-                    # Listar courseWork (tarefas)
-                    resp_work = http_requests.get(
-                        f"{base_url}/courses/{course_id}/courseWork",
-                        headers=headers, timeout=15,
-                        params={"orderBy": "dueDate desc", "pageSize": 20}
-                    )
-                    
-                    if resp_work.status_code == 200:
-                        works = resp_work.json().get("courseWork", [])
-                        for work in works:
-                            tarefa = {
-                                "turma": course_name,
-                                "titulo": work.get("title", ""),
-                                "descricao": work.get("description", ""),
-                                "tipo": work.get("workType", ""),
-                                "estado": work.get("state", ""),
-                                "dataEntrega": "",
-                                "materiais": []
-                            }
-                            
-                            # Extrair data de entrega
-                            due = work.get("dueDate", {})
-                            if due:
-                                tarefa["dataEntrega"] = f"{due.get('day', '')}/{due.get('month', '')}/{due.get('year', '')}"
-                            
-                            # Extrair materiais/anexos
-                            materials = work.get("materials", [])
-                            for mat in materials:
-                                if "driveFile" in mat:
-                                    tarefa["materiais"].append({
-                                        "tipo": "drive",
-                                        "titulo": mat["driveFile"].get("driveFile", {}).get("title", ""),
-                                        "link": mat["driveFile"].get("driveFile", {}).get("alternateLink", "")
-                                    })
-                                elif "link" in mat:
-                                    tarefa["materiais"].append({
-                                        "tipo": "link",
-                                        "titulo": mat["link"].get("title", ""),
-                                        "url": mat["link"].get("url", "")
-                                    })
-                            
-                            dados["tarefas"].append(tarefa)
-                    
-                    # Listar submissions (entregas da aluna)
-                    resp_sub = http_requests.get(
-                        f"{base_url}/courses/{course_id}/courseWork/-/studentSubmissions",
-                        headers=headers, timeout=15,
-                        params={"pageSize": 50}
-                    )
-                    
-                    if resp_sub.status_code == 200:
-                        subs = resp_sub.json().get("studentSubmissions", [])
-                        # Processar submissions se necessário
-                        
+                    entrar_btn = page.locator('button:has-text("Entrar"), a:has-text("Entrar"), button:has-text("Login")')
+                    if await entrar_btn.count() > 0:
+                        await entrar_btn.first.click()
+                        await page.wait_for_timeout(2000)
+                except:
+                    pass
+
+                # Inserir email
+                try:
+                    email_input = page.locator('input[type="email"], input[name="email"], input[placeholder*="mail"]')
+                    if await email_input.count() > 0:
+                        await email_input.first.fill(email)
+                        await page.wait_for_timeout(500)
+
+                    # Inserir senha
+                    pwd_input = page.locator('input[type="password"], input[name="password"]')
+                    if await pwd_input.count() > 0:
+                        await pwd_input.first.fill(password)
+                        await page.wait_for_timeout(500)
+
+                    # Clicar em Entrar/Submit
+                    submit_btn = page.locator('button[type="submit"], button:has-text("Entrar"), button:has-text("Login")')
+                    if await submit_btn.count() > 0:
+                        await submit_btn.first.click()
+                        await page.wait_for_timeout(5000)
+
                 except Exception as e:
-                    dados["erros"].append(f"Turma {course_name}: {str(e)}")
-        
-        elif resp.status_code == 401:
-            dados["erros"].append("Token Google expirado. O n8n precisa renovar o token OAuth.")
-        elif resp.status_code == 403:
-            dados["erros"].append("Sem permissão para acessar Google Classroom. Verifique os escopos OAuth.")
-        else:
-            dados["erros"].append(f"Erro API Classroom: {resp.status_code} - {resp.text[:200]}")
-    
-    except Exception as e:
-        dados["erros"].append(f"Erro geral Classroom: {str(e)}")
-    
+                    dados["erros"].append(f"Erro no login SuperApp: {str(e)}")
+
+            # Verificar se logou
+            page_text = await page.evaluate("document.body.innerText")
+            logger.info(f"SuperApp - Texto da página (primeiros 500 chars): {page_text[:500]}")
+
+            # 2. Navegar para Notas Acadêmicas
+            logger.info("Acessando Notas Acadêmicas...")
+            try:
+                notas_link = page.locator('a:has-text("Notas"), a:has-text("Gradebook"), button:has-text("Notas")')
+                if await notas_link.count() > 0:
+                    await notas_link.first.click()
+                    await page.wait_for_timeout(5000)
+
+                    # Extrair texto da página de notas
+                    notas_text = await page.evaluate("document.body.innerText")
+                    dados["notas"] = [{"texto_raw": notas_text[:10000]}]
+                    logger.info(f"Notas: {len(notas_text)} chars extraídos")
+            except Exception as e:
+                dados["erros"].append(f"Notas: {str(e)}")
+
+            # 3. Voltar e navegar para Registros Acadêmicos
+            logger.info("Acessando Registros Acadêmicos...")
+            try:
+                await page.goto("https://liceu-jardim.layers.education/@liceu-jardim/", wait_until="networkidle", timeout=30000)
+                await page.wait_for_timeout(3000)
+
+                registros_link = page.locator('a:has-text("Registros"), a:has-text("Records"), button:has-text("Registros")')
+                if await registros_link.count() > 0:
+                    await registros_link.first.click()
+                    await page.wait_for_timeout(5000)
+
+                    # Clicar em "See all" / "Ver tudo"
+                    see_all = page.locator('button:has-text("See all"), button:has-text("Ver tudo"), a:has-text("See all")')
+                    if await see_all.count() > 0:
+                        await see_all.first.click()
+                        await page.wait_for_timeout(3000)
+
+                    registros_text = await page.evaluate("document.body.innerText")
+                    dados["registros"] = [{"texto_raw": registros_text[:10000]}]
+                    logger.info(f"Registros: {len(registros_text)} chars extraídos")
+            except Exception as e:
+                dados["erros"].append(f"Registros: {str(e)}")
+
+            # 4. Conteúdo de Aula
+            logger.info("Acessando Conteúdo de Aula...")
+            try:
+                await page.goto("https://liceu-jardim.layers.education/@liceu-jardim/", wait_until="networkidle", timeout=30000)
+                await page.wait_for_timeout(3000)
+
+                conteudo_link = page.locator('a:has-text("Conteúdo"), button:has-text("Conteúdo"), a:has-text("Content")')
+                if await conteudo_link.count() > 0:
+                    await conteudo_link.first.click()
+                    await page.wait_for_timeout(8000)
+
+                    conteudo_text = await page.evaluate("document.body.innerText")
+                    dados["conteudos"] = [{"texto_raw": conteudo_text[:10000]}]
+                    logger.info(f"Conteúdo de Aula: {len(conteudo_text)} chars extraídos")
+            except Exception as e:
+                dados["erros"].append(f"Conteúdo de Aula: {str(e)}")
+
+        except Exception as e:
+            logger.error(f"Erro geral SuperApp: {e}\n{traceback.format_exc()}")
+            dados["erros"].append(f"Erro geral: {str(e)}")
+
+        finally:
+            await browser.close()
+
+    dados["resumo"] = {
+        "total_conteudos": len(dados["conteudos"]),
+        "total_notas": len(dados["notas"]),
+        "total_registros": len(dados["registros"]),
+        "total_erros": len(dados["erros"])
+    }
+
     return dados
 
 
 # ============================================================
 # SCRAPING - ROTEIRO DE ESTUDOS
 # ============================================================
-def scrape_roteiro(req: ScrapeRequest) -> dict:
+async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
     """
-    Acessa roteiro.jardim.li e extrai datas de provas.
-    Usa requests + BeautifulSoup + OpenAI.
+    Navega no Roteiro de Estudos (Glide app) via Playwright e coleta:
+    - Provas AO (Avaliação Objetiva)
+    - Provas AD (Avaliação Dissertativa)
+    - Provas de Inglês
     """
-    dados = {"provas": [], "conteudos": [], "html_raw": "", "erros": []}
-    
-    try:
-        logger.info("Acessando roteiro.jardim.li...")
-        resp = http_requests.get("https://roteiro.jardim.li", timeout=15, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        })
-        
-        html = resp.text
-        soup = BeautifulSoup(html, "html.parser")
-        
-        # Remover scripts e styles
-        for tag in soup(["script", "style", "nav", "footer", "header"]):
-            tag.decompose()
-        
-        # Extrair texto limpo
-        texto = soup.get_text(separator="\n", strip=True)
-        dados["html_raw"] = texto[:10000]
-        
-        # Extrair datas com regex
-        padroes = [
-            r'(AO\d?|AD\d?|OIA|Prova|Avaliação|Simulado|Teste)[^\n]{0,100}?(\d{1,2}[/\-]\d{1,2}(?:[/\-]\d{2,4})?)',
-            r'(\d{1,2}[/\-]\d{1,2}(?:[/\-]\d{2,4})?)[^\n]{0,100}?(AO\d?|AD\d?|OIA|Prova|Avaliação|Simulado|Teste)',
-        ]
-        
-        encontrados = set()
-        for padrao in padroes:
-            matches = re.finditer(padrao, texto, re.IGNORECASE)
-            for m in matches:
-                ctx = m.group(0)[:200]
-                if ctx not in encontrados:
-                    encontrados.add(ctx)
-                    dados["provas"].append({
-                        "contexto": ctx,
-                        "match_groups": [m.group(1), m.group(2)]
-                    })
-        
-        # Extrair tabelas
-        tables = soup.find_all("table")
-        for table in tables:
-            rows = []
-            for tr in table.find_all("tr"):
-                cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
-                if cells:
-                    rows.append(cells)
-            if rows:
-                dados["conteudos"].append({"tabela": rows})
-        
-        # Usar OpenAI para interpretar o conteúdo completo
-        if OPENAI_API_KEY and len(texto) > 50:
-            logger.info("Usando OpenAI para interpretar roteiro...")
-            ai_resp = chamar_openai(
-                system_prompt=(
-                    "Você é um assistente que extrai informações acadêmicas de páginas web. "
-                    "Extraia TODAS as datas de provas, avaliações (AO, AD, OIA), trabalhos e atividades. "
-                    "Para cada item, identifique: tipo (AO/AD/OIA/Prova/Trabalho), matéria, data (DD/MM/YYYY), descrição. "
-                    "Padronize: 'Matemática 1' = 'Álgebra', 'Matemática 2' = 'Geometria'. "
-                    "Retorne APENAS JSON válido: {\"provas\": [{\"tipo\": \"\", \"materia\": \"\", \"data\": \"\", \"descricao\": \"\"}]}"
-                ),
-                user_prompt=f"Texto extraído do roteiro de estudos (roteiro.jardim.li):\n\n{texto[:6000]}"
-            )
-            
-            try:
-                # Tentar extrair JSON da resposta
-                json_match = re.search(r'\{[\s\S]*\}', ai_resp)
-                if json_match:
-                    dados["provas_ai"] = json.loads(json_match.group(0))
+    from playwright.async_api import async_playwright
+
+    dados = {
+        "provas_ao": [],
+        "provas_ad": [],
+        "provas_ingles": [],
+        "erros": []
+    }
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=False,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-blink-features=AutomationControlled",
+                "--window-size=1280,800",
+            ]
+        )
+
+        context = await browser.new_context(
+            viewport={"width": 1280, "height": 800},
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            locale="pt-BR"
+        )
+
+        page = await context.new_page()
+
+        try:
+            # O Roteiro pode precisar de login Google
+            # Primeiro, fazer login Google se necessário
+            email = req.email or MELISSA_EMAIL
+            password = req.password or MELISSA_PASSWORD
+
+            logger.info("Acessando Roteiro de Estudos...")
+            await page.goto("https://roteiro.jardim.li/dl/d0a5f4", wait_until="networkidle", timeout=30000)
+            await page.wait_for_timeout(5000)
+
+            # Verificar se redirecionou para login Google
+            if "accounts.google.com" in page.url:
+                logger.info("Roteiro requer login Google...")
+                login_ok = await google_login(page, email, password)
+                if login_ok:
+                    await page.goto("https://roteiro.jardim.li/dl/d0a5f4", wait_until="networkidle", timeout=30000)
+                    await page.wait_for_timeout(5000)
                 else:
-                    dados["provas_ai_raw"] = ai_resp
-            except json.JSONDecodeError:
-                dados["provas_ai_raw"] = ai_resp
-        
-        dados["texto_length"] = len(texto)
-        logger.info(f"Roteiro: {len(texto)} chars, {len(dados['provas'])} provas regex, tabelas: {len(dados['conteudos'])}")
-    
-    except Exception as e:
-        dados["erros"].append(f"Erro ao acessar roteiro: {str(e)}")
-    
+                    dados["erros"].append("Falha no login Google para o Roteiro")
+
+            # Extrair texto da página
+            page_text = await page.evaluate("document.body.innerText")
+            logger.info(f"Roteiro: {len(page_text)} chars na página")
+
+            # Tentar encontrar abas AO, AD, Inglês
+            abas = ["AD", "AO", "Inglês"]
+            for aba_nome in abas:
+                try:
+                    aba = page.locator(f'button:has-text("{aba_nome}"), a:has-text("{aba_nome}"), [role="tab"]:has-text("{aba_nome}")')
+                    if await aba.count() > 0:
+                        await aba.first.click()
+                        await page.wait_for_timeout(3000)
+
+                        # Extrair conteúdo da aba
+                        aba_text = await page.evaluate("document.body.innerText")
+
+                        # Clicar em cada item da lista para ver detalhes
+                        items = page.locator('.list-item, [data-testid*="list"], .glide-list-item')
+                        item_count = await items.count()
+
+                        provas_aba = []
+                        for i in range(item_count):
+                            try:
+                                await items.nth(i).click()
+                                await page.wait_for_timeout(2000)
+
+                                item_text = await page.evaluate("document.body.innerText")
+                                provas_aba.append({
+                                    "texto_raw": item_text[:3000],
+                                    "indice": i
+                                })
+
+                                # Voltar para a lista
+                                back_btn = page.locator('button[aria-label="Back"], button:has-text("Voltar"), .back-button')
+                                if await back_btn.count() > 0:
+                                    await back_btn.first.click()
+                                    await page.wait_for_timeout(1000)
+
+                            except Exception as e:
+                                logger.warning(f"Erro ao acessar item {i} da aba {aba_nome}: {e}")
+
+                        if aba_nome == "AO":
+                            dados["provas_ao"] = provas_aba
+                        elif aba_nome == "AD":
+                            dados["provas_ad"] = provas_aba
+                        elif aba_nome == "Inglês":
+                            dados["provas_ingles"] = provas_aba
+
+                        logger.info(f"Aba {aba_nome}: {len(provas_aba)} itens encontrados")
+
+                except Exception as e:
+                    dados["erros"].append(f"Aba {aba_nome}: {str(e)}")
+
+            # Fallback: extrair todo o texto da página
+            if not dados["provas_ao"] and not dados["provas_ad"]:
+                dados["texto_completo"] = page_text[:15000]
+
+        except Exception as e:
+            logger.error(f"Erro geral Roteiro: {e}\n{traceback.format_exc()}")
+            dados["erros"].append(f"Erro geral: {str(e)}")
+
+        finally:
+            await browser.close()
+
+    dados["resumo"] = {
+        "total_ao": len(dados["provas_ao"]),
+        "total_ad": len(dados["provas_ad"]),
+        "total_ingles": len(dados["provas_ingles"]),
+        "total_erros": len(dados["erros"])
+    }
+
     return dados
 
 
@@ -465,44 +729,29 @@ def scrape_roteiro(req: ScrapeRequest) -> dict:
 def health():
     return {
         "status": "ok",
-        "service": "melissa-scraper-lite",
-        "version": "2.0.0",
+        "service": "melissa-scraper-playwright",
+        "version": "3.0.0",
         "timestamp": datetime.now().isoformat(),
-        "openai_configured": bool(OPENAI_API_KEY),
-        "superapp_configured": bool(SUPERAPP_EMAIL),
+        "playwright": True
     }
 
 
 @app.get("/")
 def root():
     return {
-        "service": "Melissa Scraper API Lite",
-        "version": "2.0.0",
+        "service": "Melissa Scraper API v3 (Playwright)",
+        "version": "3.0.0",
         "docs": "/docs",
         "health": "/health",
-        "endpoints": ["/scrape/superapp", "/scrape/classroom", "/scrape/roteiro", "/scrape/all"]
+        "endpoints": ["/scrape/classroom", "/scrape/superapp", "/scrape/roteiro", "/scrape/all"]
     }
 
 
-@app.post("/scrape/superapp", response_model=ScrapeResponse)
-def endpoint_superapp(req: ScrapeRequest, authorization: str = Header(None)):
-    verificar_auth(authorization)
-    logger.info(f"Scraping SuperApp para {req.aluna}")
-    dados = scrape_superapp(req)
-    return ScrapeResponse(
-        status="success" if not dados.get("erros") else "partial",
-        fonte="superapp",
-        data_coleta=datetime.now().isoformat(),
-        dados=dados,
-        erros=dados.get("erros", [])
-    )
-
-
 @app.post("/scrape/classroom", response_model=ScrapeResponse)
-def endpoint_classroom(req: ScrapeRequest, authorization: str = Header(None)):
+async def endpoint_classroom(req: ScrapeRequest, authorization: str = Header(None)):
     verificar_auth(authorization)
     logger.info(f"Scraping Classroom para {req.aluna}")
-    dados = scrape_classroom(req)
+    dados = await scrape_classroom_async(req)
     return ScrapeResponse(
         status="success" if not dados.get("erros") else "partial",
         fonte="classroom",
@@ -512,11 +761,25 @@ def endpoint_classroom(req: ScrapeRequest, authorization: str = Header(None)):
     )
 
 
+@app.post("/scrape/superapp", response_model=ScrapeResponse)
+async def endpoint_superapp(req: ScrapeRequest, authorization: str = Header(None)):
+    verificar_auth(authorization)
+    logger.info(f"Scraping SuperApp para {req.aluna}")
+    dados = await scrape_superapp_async(req)
+    return ScrapeResponse(
+        status="success" if not dados.get("erros") else "partial",
+        fonte="superapp",
+        data_coleta=datetime.now().isoformat(),
+        dados=dados,
+        erros=dados.get("erros", [])
+    )
+
+
 @app.post("/scrape/roteiro", response_model=ScrapeResponse)
-def endpoint_roteiro(req: ScrapeRequest, authorization: str = Header(None)):
+async def endpoint_roteiro(req: ScrapeRequest, authorization: str = Header(None)):
     verificar_auth(authorization)
     logger.info("Scraping Roteiro de Estudos")
-    dados = scrape_roteiro(req)
+    dados = await scrape_roteiro_async(req)
     return ScrapeResponse(
         status="success" if not dados.get("erros") else "partial",
         fonte="roteiro",
@@ -527,16 +790,26 @@ def endpoint_roteiro(req: ScrapeRequest, authorization: str = Header(None)):
 
 
 @app.post("/scrape/all")
-def endpoint_all(req: ScrapeRequest, authorization: str = Header(None)):
+async def endpoint_all(req: ScrapeRequest, authorization: str = Header(None)):
     verificar_auth(authorization)
     logger.info(f"Scraping completo para {req.aluna}")
-    
+
+    # Executar em paralelo
+    classroom_task = scrape_classroom_async(req)
+    superapp_task = scrape_superapp_async(req)
+    roteiro_task = scrape_roteiro_async(req)
+
+    classroom, superapp, roteiro = await asyncio.gather(
+        classroom_task, superapp_task, roteiro_task,
+        return_exceptions=True
+    )
+
     return {
         "status": "success",
         "data_coleta": datetime.now().isoformat(),
-        "superapp": scrape_superapp(req),
-        "classroom": scrape_classroom(req),
-        "roteiro": scrape_roteiro(req)
+        "classroom": classroom if not isinstance(classroom, Exception) else {"erros": [str(classroom)]},
+        "superapp": superapp if not isinstance(superapp, Exception) else {"erros": [str(superapp)]},
+        "roteiro": roteiro if not isinstance(roteiro, Exception) else {"erros": [str(roteiro)]}
     }
 
 
