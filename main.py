@@ -597,6 +597,8 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
     - Provas AO (Avaliação Objetiva)
     - Provas AD (Avaliação Dissertativa)
     - Provas de Inglês
+    Usa o mesmo método de login do Classroom: faz Google Login PRIMEIRO,
+    depois navega para o Roteiro já autenticado.
     """
     from playwright.async_api import async_playwright
 
@@ -607,7 +609,12 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
         "erros": []
     }
 
+    email = req.email or MELISSA_EMAIL
+    password = req.password or MELISSA_PASSWORD
+
     async with async_playwright() as p:
+        # headless=False + Xvfb = browser real com display virtual
+        # Isso evita detecção de bot e CAPTCHA do Google
         browser = await p.chromium.launch(
             headless=False,
             args=[
@@ -629,24 +636,29 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
         page = await context.new_page()
 
         try:
-            # O Roteiro pode precisar de login Google
-            # Primeiro, fazer login Google se necessário
-            email = req.email or MELISSA_EMAIL
-            password = req.password or MELISSA_PASSWORD
+            # 1. Login no Google PRIMEIRO (mesmo método do Classroom)
+            logger.info("Iniciando login no Google (método Classroom)...")
+            login_ok = await google_login(page, email, password)
 
-            logger.info("Acessando Roteiro de Estudos...")
+            if not login_ok:
+                dados["erros"].append("Falha no login Google. Verifique credenciais ou desafio de segurança.")
+                await browser.close()
+                return dados
+
+            # 2. Agora navegar para o Roteiro de Estudos já autenticado
+            logger.info("Navegando para o Roteiro de Estudos (já autenticado)...")
             await page.goto("https://roteiro.jardim.li/dl/d0a5f4", wait_until="networkidle", timeout=30000)
             await page.wait_for_timeout(5000)
 
-            # Verificar se redirecionou para login Google
+            # Verificar se ainda redirecionou para login (fallback)
             if "accounts.google.com" in page.url:
-                logger.info("Roteiro requer login Google...")
+                logger.warning("Ainda redirecionou para login, tentando novamente...")
                 login_ok = await google_login(page, email, password)
                 if login_ok:
                     await page.goto("https://roteiro.jardim.li/dl/d0a5f4", wait_until="networkidle", timeout=30000)
                     await page.wait_for_timeout(5000)
                 else:
-                    dados["erros"].append("Falha no login Google para o Roteiro")
+                    dados["erros"].append("Falha no login Google para o Roteiro (segunda tentativa)")
 
             # Extrair texto da página
             page_text = await page.evaluate("document.body.innerText")
