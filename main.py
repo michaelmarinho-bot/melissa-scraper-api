@@ -613,9 +613,10 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
     password = req.password or MELISSA_PASSWORD
 
     async with async_playwright() as p:
-        # headless=False + Xvfb para evitar CAPTCHA do Google
+        # headless=True para economizar memória (512MB no Render)
+        # Login Google funciona em headless para domínios educacionais (g12.br)
         browser = await p.chromium.launch(
-            headless=False,
+            headless=True,
             args=[
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
@@ -628,6 +629,9 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
                 "--disable-default-apps",
                 "--disable-sync",
                 "--no-first-run",
+                "--single-process",
+                "--disable-software-rasterizer",
+                "--js-flags=--max-old-space-size=256",
             ]
         )
 
@@ -639,10 +643,12 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
 
         page = await context.new_page()
 
-        # Bloquear imagens e fontes para economizar memória
-        await page.route("**/*.{png,jpg,jpeg,gif,svg,webp,woff,woff2,ttf,eot}", lambda route: route.abort())
+        # Bloquear imagens, fontes, CSS e media para economizar memória
+        await page.route("**/*.{png,jpg,jpeg,gif,svg,webp,woff,woff2,ttf,eot,mp4,mp3,avi}", lambda route: route.abort())
         await page.route("**/fonts.googleapis.com/**", lambda route: route.abort())
         await page.route("**/fonts.gstatic.com/**", lambda route: route.abort())
+        await page.route("**/www.google-analytics.com/**", lambda route: route.abort())
+        await page.route("**/www.googletagmanager.com/**", lambda route: route.abort())
 
         try:
             # 1. Navegar DIRETO para o Roteiro de Estudos
@@ -650,9 +656,9 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
             await page.goto("https://roteiro.jardim.li/dl/d0a5f4", wait_until="domcontentloaded", timeout=30000)
             await page.wait_for_timeout(5000)
 
-            # 2. Clicar em "Continuar com o Google" na página do Roteiro
-            logger.info("Procurando botão 'Continuar com o Google'...")
-            google_btn = page.locator('button:has-text("Google"), a:has-text("Google"), div:has-text("Continuar com o Google"):visible')
+            # 2. Clicar em "Continue with Google" na página do Roteiro
+            logger.info("Procurando botão 'Continue with Google'...")
+            google_btn = page.locator('#sign-in-with-google-button')
             btn_count = await google_btn.count()
             logger.info(f"Botões Google encontrados: {btn_count}")
 
