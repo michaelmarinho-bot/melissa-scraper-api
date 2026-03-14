@@ -15,6 +15,7 @@ Endpoints:
 import os
 import json
 import re
+import gc
 import asyncio
 import logging
 import traceback
@@ -120,7 +121,7 @@ class ScrapeResponse(BaseModel):
 app = FastAPI(
     title="Melissa Scraper API",
     description="API de scraping com Playwright para a Agente Melissa",
-    version="3.0.0"
+    version="3.2.0"
 )
 
 
@@ -1035,9 +1036,13 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
     - Provas de Inglês
     Estratégia: Navega direto para o Roteiro, clica "Continuar com Google",
     preenche email/senha no popup do Google, e coleta os dados.
+    Usa headless=True para economizar memória (popup Google funciona em headless).
     """
     from playwright.async_api import async_playwright
     import asyncio as _asyncio
+
+    # Forçar garbage collection antes de iniciar (liberar memória)
+    gc.collect()
 
     dados = {
         "provas_ao": [],
@@ -1051,7 +1056,7 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
-            headless=False,
+            headless=True,
             args=[
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
@@ -1059,6 +1064,15 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
                 "--disable-gpu",
                 "--disable-blink-features=AutomationControlled",
                 "--window-size=1280,800",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-default-apps",
+                "--disable-sync",
+                "--disable-translate",
+                "--metrics-recording-only",
+                "--no-first-run",
+                "--single-process",
+                "--js-flags=--max-old-space-size=256",
             ]
         )
 
@@ -1070,12 +1084,14 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
 
         page = await context.new_page()
 
-        # Bloquear imagens, fontes e analytics para economizar memória
+        # Bloquear recursos pesados para economizar memória
         await page.route("**/*.{png,jpg,jpeg,gif,svg,webp,woff,woff2,ttf,eot,mp4,mp3,avi}", lambda route: route.abort())
         await page.route("**/fonts.googleapis.com/**", lambda route: route.abort())
         await page.route("**/fonts.gstatic.com/**", lambda route: route.abort())
         await page.route("**/www.google-analytics.com/**", lambda route: route.abort())
         await page.route("**/www.googletagmanager.com/**", lambda route: route.abort())
+        await page.route("**/play.google.com/**", lambda route: route.abort())
+        await page.route("**/apis.google.com/js/api.js**", lambda route: route.abort())
 
         try:
             # 1. NAVEGAR DIRETO PARA O ROTEIRO
@@ -1213,6 +1229,7 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
 
         finally:
             await browser.close()
+            gc.collect()  # Liberar memória após fechar browser
 
     dados["resumo"] = {
         "total_ao": len(dados["provas_ao"]),
@@ -1235,8 +1252,10 @@ async def run_scrape_job(job_id: str, fonte: str, scrape_func, req):
         complete_job(job_id, dados, dados.get("erros", []))
         logger.info(f"[Job {job_id}] Scraping {fonte} conclu\u00eddo!")
     except Exception as e:
-        logger.error(f"[Job {job_id}] Erro no scraping {fonte}: {e}")
+        logger.error(f"[Job {job_id}] Erro no scraping {fonte}: {e}\n{traceback.format_exc()}")
         fail_job(job_id, str(e))
+    finally:
+        gc.collect()  # Sempre liberar memória após job
 
 
 # ============================================================
@@ -1247,7 +1266,7 @@ def health():
     return {
         "status": "ok",
         "service": "melissa-scraper-playwright",
-        "version": "3.1.0",
+        "version": "3.2.0",
         "timestamp": datetime.now().isoformat(),
         "playwright": True,
         "async_jobs": True
@@ -1257,8 +1276,8 @@ def health():
 @app.get("/")
 def root():
     return {
-        "service": "Melissa Scraper API v3.1 (Playwright + Async Jobs)",
-        "version": "3.1.0",
+        "service": "Melissa Scraper API v3.2 (Playwright + Async Jobs + Memory Optimized)",
+        "version": "3.2.0",
         "docs": "/docs",
         "health": "/health",
         "endpoints": [
