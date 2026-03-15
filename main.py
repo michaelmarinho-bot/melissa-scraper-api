@@ -165,7 +165,8 @@ async def google_login(page, email: str, password: str, max_retries: int = 3):
             await page.wait_for_timeout(4000)
 
             # Aguardar tela de senha (/challenge/pwd é NORMAL, não é CAPTCHA)
-            password_input = page.locator('input[type="password"]')
+            # IMPORTANTE: Google tem campo hidden decoy - usar :visible ou excluir aria-hidden
+            password_input = page.locator('input[type="password"]:not([aria-hidden="true"]):not([tabindex="-1"])')
             await password_input.wait_for(state="visible", timeout=15000)
             await password_input.fill(password)
             await page.wait_for_timeout(500)
@@ -1147,8 +1148,9 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
                 await popup.wait_for_timeout(5000)
 
                 # 4. PREENCHER SENHA NO POPUP
+                # IMPORTANTE: Google tem campo hidden decoy - excluir aria-hidden e tabindex=-1
                 logger.info("[Roteiro] Preenchendo senha...")
-                password_input = popup.locator('input[type="password"]')
+                password_input = popup.locator('input[type="password"]:not([aria-hidden="true"]):not([tabindex="-1"])')
                 await password_input.first.wait_for(state="visible", timeout=15000)
                 await password_input.first.fill(password)
                 await popup.wait_for_timeout(500)
