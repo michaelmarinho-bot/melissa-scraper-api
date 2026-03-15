@@ -1096,7 +1096,7 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
         try:
             # 1. NAVEGAR DIRETO PARA O ROTEIRO
             logger.info("[Roteiro] Navegando para o Roteiro de Estudos...")
-            await page.goto("https://roteiro.jardim.li/dl/d0a5f4", wait_until="domcontentloaded", timeout=30000)
+            await page.goto("https://roteiro.jardim.li/dl/d0a5f4", wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_timeout(5000)
 
             page_text = await page.evaluate("document.body.innerText")
