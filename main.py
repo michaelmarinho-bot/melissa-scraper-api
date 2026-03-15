@@ -33,7 +33,7 @@ API_SECRET = os.environ.get("MELISSA_API_SECRET", "") or os.environ.get("MELISSA
 
 # Credenciais da Melissa (conta escolar)
 MELISSA_EMAIL = os.environ.get("MELISSA_EMAIL", "melissa.marinho@liceujardim.g12.br")
-MELISSA_PASSWORD = os.environ.get("MELISSA_PASSWORD", "elvis!!1")
+MELISSA_PASSWORD = os.environ.get("MELISSA_PASSWORD", "Elvis!!1")
 
 # Credenciais do SuperApp (pode ser diferente)
 SUPERAPP_EMAIL = os.environ.get("SUPERAPP_EMAIL", MELISSA_EMAIL)
