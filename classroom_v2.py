@@ -323,232 +323,177 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 await page.wait_for_timeout(1000)
 
-            # 5. DEBUG: capturar o que a página mostra
-            page_text = await page.evaluate("document.body.innerText")
-            page_url = page.url
-            logger.info(f"[ClassroomV2] URL atual: {page_url}")
-            logger.info(f"[ClassroomV2] Texto da página (500 chars): {page_text[:500]}")
+            # 5. Estratégia: expandir materiais via JS e coletar anexos
+            # Baseado no debug: aria-expanded encontra 14 elementos, mas inclui menus/headers
+            # Filtramos por: nome contém palavras-chave de material, não de UI
+            
+            logger.info(f"[ClassroomV2] URL atual: {page.url}")
 
-            # 5b. Expandir todos os materiais e coletar anexos
-            # Tentar múltiplos seletores para encontrar materiais
+            # Abordagem direta: expandir TODOS os aria-expanded que parecem materiais
+            # e depois coletar TODOS os links do Drive de uma vez
             materiais_info = await page.evaluate("""
                 () => {
                     const result = [];
-                    const debug = { selectors_tried: [] };
-
-                    // Seletor 1: data-stream-item-id
-                    const s1 = document.querySelectorAll('div[role="button"][data-stream-item-id]');
-                    debug.selectors_tried.push({ selector: 'div[role=button][data-stream-item-id]', count: s1.length });
-                    s1.forEach(btn => {
-                        result.push({
-                            nome: btn.getAttribute('aria-label') || btn.textContent?.trim()?.substring(0, 100) || '',
-                            id: btn.getAttribute('data-stream-item-id') || '',
-                            expanded: btn.getAttribute('aria-expanded'),
-                            source: 's1'
-                        });
+                    const ignorar = ['menu principal', 'google apps', 'minhas inscrições', 
+                                     'conta do google', 'ajuda e comentários', 'filtro de tópicos',
+                                     'opções de temas', 'opções do material'];
+                    
+                    const items = document.querySelectorAll('[aria-expanded]');
+                    items.forEach((el, idx) => {
+                        const label = el.getAttribute('aria-label') || '';
+                        const text = el.textContent?.trim()?.substring(0, 150) || '';
+                        const nome = label || text;
+                        const nomeLower = nome.toLowerCase();
+                        
+                        // Filtrar: ignorar elementos de UI
+                        const ehUI = ignorar.some(ig => nomeLower.startsWith(ig));
+                        // Filtrar: ignorar tópicos (começam com "Tópico:")
+                        const ehTopico = nomeLower.startsWith('tópico:') || nomeLower.startsWith('topico:');
+                        
+                        if (!ehUI && !ehTopico && nome.length > 3) {
+                            result.push({
+                                nome: nome.substring(0, 150),
+                                index: idx,
+                                expanded: el.getAttribute('aria-expanded'),
+                                tag: el.tagName
+                            });
+                        }
                     });
-
-                    // Seletor 2: aria-expanded (materiais expandíveis)
-                    if (result.length === 0) {
-                        const s2 = document.querySelectorAll('[aria-expanded]');
-                        debug.selectors_tried.push({ selector: '[aria-expanded]', count: s2.length });
-                        s2.forEach(el => {
-                            const nome = el.getAttribute('aria-label') || el.textContent?.trim()?.substring(0, 100) || '';
-                            if (nome && nome.length > 3) {
-                                result.push({ nome, id: '', expanded: el.getAttribute('aria-expanded'), source: 's2' });
-                            }
-                        });
-                    }
-
-                    // Seletor 3: role=treeitem (Classroom usa tree structure)
-                    if (result.length === 0) {
-                        const s3 = document.querySelectorAll('[role="treeitem"], [role="listitem"]');
-                        debug.selectors_tried.push({ selector: '[role=treeitem/listitem]', count: s3.length });
-                        s3.forEach(el => {
-                            const nome = el.textContent?.trim()?.substring(0, 100) || '';
-                            if (nome && nome.length > 3) {
-                                result.push({ nome, id: '', expanded: null, source: 's3' });
-                            }
-                        });
-                    }
-
-                    // Seletor 4: links de atividades/materiais
-                    if (result.length === 0) {
-                        const s4 = document.querySelectorAll('a[href*="/c/"][href*="/a/"], a[href*="/c/"][href*="/m/"], a[href*="/c/"][href*="/p/"]');
-                        debug.selectors_tried.push({ selector: 'a[href /c/ /a/ /m/ /p/]', count: s4.length });
-                        s4.forEach(a => {
-                            result.push({ nome: a.textContent?.trim()?.substring(0, 100) || '', id: a.href, expanded: null, source: 's4' });
-                        });
-                    }
-
-                    // Seletor 5: qualquer div com role=button
-                    if (result.length === 0) {
-                        const s5 = document.querySelectorAll('div[role="button"]');
-                        debug.selectors_tried.push({ selector: 'div[role=button]', count: s5.length });
-                        s5.forEach(btn => {
-                            const nome = btn.textContent?.trim()?.substring(0, 100) || '';
-                            if (nome && nome.length > 5 && !nome.includes('Google') && !nome.includes('Menu')) {
-                                result.push({ nome, id: '', expanded: btn.getAttribute('aria-expanded'), source: 's5' });
-                            }
-                        });
-                    }
-
-                    // Seletor 6: links do Drive diretamente na página
-                    const driveLinks = document.querySelectorAll('a[href*="drive.google.com"], a[href*="docs.google.com"]');
-                    debug.selectors_tried.push({ selector: 'drive/docs links', count: driveLinks.length });
-
-                    // Seletor 7: todos os links na página
-                    const allLinks = document.querySelectorAll('a[href]');
-                    debug.selectors_tried.push({ selector: 'all a[href]', count: allLinks.length });
-                    const linkSample = [];
-                    allLinks.forEach((a, i) => {
-                        if (i < 20) linkSample.push({ text: a.textContent?.trim()?.substring(0, 50), href: a.href?.substring(0, 80) });
-                    });
-                    debug.link_sample = linkSample;
-
-                    return { materiais: result, debug };
+                    return result;
                 }
             """)
 
-            # Separar debug dos materiais
-            debug_info = materiais_info.get('debug', {})
-            materiais_info = materiais_info.get('materiais', [])
+            logger.info(f"[ClassroomV2] {len(materiais_info)} materiais filtrados (excluindo UI/tópicos)")
+            for m in materiais_info:
+                logger.info(f"[ClassroomV2]   Material: {m['nome'][:80]} | expanded={m['expanded']}")
 
-            logger.info(f"[ClassroomV2] {len(materiais_info)} materiais encontrados")
-            logger.info(f"[ClassroomV2] Debug seletores: {debug_info.get('selectors_tried', [])}")
-            logger.info(f"[ClassroomV2] Debug links sample: {debug_info.get('link_sample', [])[:5]}")
-
-            # Salvar debug no resultado para análise
-            dados['debug'] = debug_info
-
-            # 6. Para cada material, expandir e coletar anexos
-            for mat in materiais_info:
-                mat_nome = mat.get("nome", "")
-                logger.info(f"[ClassroomV2] Processando material: {mat_nome}")
-
-                try:
-                    # Expandir o material clicando nele
-                    if mat.get("id"):
-                        await page.evaluate(f"""
-                            () => {{
-                                const btn = document.querySelector('div[data-stream-item-id="{mat["id"]}"]');
-                                if (btn && btn.getAttribute('aria-expanded') !== 'true') {{
-                                    btn.click();
-                                }}
-                            }}
-                        """)
-                    else:
-                        # Fallback: clicar por texto
-                        btn = page.locator(f'div[role="button"]:has-text("{mat_nome[:50]}")')
-                        if await btn.count() > 0:
-                            expanded = await btn.first.get_attribute('aria-expanded')
-                            if expanded != 'true':
-                                await btn.first.click()
-
-                    await page.wait_for_timeout(2000)
-
-                    # Coletar links de anexos após expandir
-                    anexos = await page.evaluate("""
-                        () => {
-                            const anexos = [];
-                            // Pegar todos os links de anexos visíveis
-                            document.querySelectorAll('a[href*="drive.google.com/file"], a[href*="drive.google.com/open"], a[href*="docs.google.com"], a[href*="slides.google.com"]').forEach(a => {
-                                const nome = a.textContent?.trim() || '';
-                                const url = a.href || '';
-                                if (url && nome) {
-                                    const match = url.match(/\\/d\\/([a-zA-Z0-9_-]+)/);
-                                    const fileId = match ? match[1] : '';
-                                    // Evitar duplicatas
-                                    if (fileId && !anexos.find(x => x.fileId === fileId)) {
-                                        anexos.push({ nome, url, fileId });
-                                    }
-                                }
-                            });
-                            return anexos;
+            # Expandir cada material via índice (sem usar has-text que falha com chars especiais)
+            await page.evaluate("""
+                () => {
+                    const ignorar = ['menu principal', 'google apps', 'minhas inscrições', 
+                                     'conta do google', 'ajuda e comentários', 'filtro de tópicos',
+                                     'opções de temas', 'opções do material'];
+                    
+                    const items = document.querySelectorAll('[aria-expanded]');
+                    items.forEach(el => {
+                        const label = el.getAttribute('aria-label') || '';
+                        const text = el.textContent?.trim()?.substring(0, 150) || '';
+                        const nome = (label || text).toLowerCase();
+                        
+                        const ehUI = ignorar.some(ig => nome.startsWith(ig));
+                        const ehTopico = nome.startsWith('tópico:') || nome.startsWith('topico:');
+                        
+                        if (!ehUI && !ehTopico && nome.length > 3) {
+                            if (el.getAttribute('aria-expanded') === 'false') {
+                                el.click();
+                            }
                         }
+                    });
+                }
+            """)
+
+            # Aguardar os materiais expandirem e os anexos carregarem
+            await page.wait_for_timeout(3000)
+
+            # Agora coletar TODOS os links do Drive/Docs/Slides de uma vez
+            anexos_todos = await page.evaluate("""
+                () => {
+                    const anexos = [];
+                    const seletores = [
+                        'a[href*="drive.google.com/file"]',
+                        'a[href*="drive.google.com/open"]', 
+                        'a[href*="docs.google.com"]',
+                        'a[href*="slides.google.com"]',
+                        'a[href*="drive.google.com/drive/folders"]'
+                    ];
+                    const selector = seletores.join(', ');
+                    
+                    document.querySelectorAll(selector).forEach(a => {
+                        const nome = a.textContent?.trim() || '';
+                        const url = a.href || '';
+                        if (url && nome && nome !== 'Pasta da turma no Google Drive') {
+                            const match = url.match(/\/d\/([a-zA-Z0-9_-]+)/);
+                            const fileId = match ? match[1] : '';
+                            if (fileId && !anexos.find(x => x.fileId === fileId)) {
+                                anexos.push({ nome, url, fileId });
+                            }
+                        }
+                    });
+                    return anexos;
+                }
+            """)
+
+            logger.info(f"[ClassroomV2] {len(anexos_todos)} anexos encontrados no total")
+            for a in anexos_todos:
+                logger.info(f"[ClassroomV2]   Anexo: {a['nome']} | fileId={a['fileId']}")
+
+            # Montar materiais com seus anexos
+            for mat in materiais_info:
+                material_data = {
+                    "nome": mat.get("nome", ""),
+                    "anexos": anexos_todos
+                }
+                dados["materiais"].append(material_data)
+
+            # 7. Para cada anexo, verificar inventário e baixar se necessário
+            for anexo in anexos_todos:
+                anexo_nome = anexo.get("nome", "")
+                file_id = anexo.get("fileId", "")
+
+                if not file_id:
+                    continue
+
+                # Verificar se já existe no Drive (inventário)
+                if anexo_nome in existentes:
+                    logger.info(f"[ClassroomV2] Arquivo já existe no Drive: {anexo_nome}")
+                    dados["arquivos_existentes"].append(anexo_nome)
+                    continue
+
+                # Baixar arquivo novo
+                logger.info(f"[ClassroomV2] Baixando: {anexo_nome} (ID: {file_id})")
+                try:
+                    download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+
+                    # Usar JavaScript fetch no contexto autenticado do browser
+                    file_content = await page.evaluate(f"""
+                        async () => {{
+                            try {{
+                                const resp = await fetch('{download_url}', {{ credentials: 'include' }});
+                                if (!resp.ok) return {{ error: 'HTTP ' + resp.status }};
+                                const blob = await resp.blob();
+                                return new Promise((resolve) => {{
+                                    const reader = new FileReader();
+                                    reader.onload = () => resolve({{ 
+                                        data: reader.result.split(',')[1],
+                                        size: blob.size,
+                                        type: blob.type
+                                    }});
+                                    reader.readAsDataURL(blob);
+                                }});
+                            }} catch(e) {{
+                                return {{ error: e.message }};
+                            }}
+                        }}
                     """)
 
-                    material_data = {
-                        "nome": mat_nome,
-                        "anexos": anexos
-                    }
-                    dados["materiais"].append(material_data)
-
-                    # 7. Para cada anexo, verificar inventário e baixar se necessário
-                    for anexo in anexos:
-                        anexo_nome = anexo.get("nome", "")
-                        file_id = anexo.get("fileId", "")
-
-                        if not file_id:
-                            continue
-
-                        # Verificar se já existe no Drive (inventário)
-                        if anexo_nome in existentes:
-                            logger.info(f"[ClassroomV2] Arquivo já existe no Drive: {anexo_nome}")
-                            dados["arquivos_existentes"].append(anexo_nome)
-                            continue
-
-                        # Baixar arquivo novo
-                        logger.info(f"[ClassroomV2] Baixando: {anexo_nome} (ID: {file_id})")
-                        try:
-                            download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
-
-                            # Usar o browser autenticado para download
-                            download_page = await context.new_page()
-                            response = await download_page.goto(download_url, wait_until="domcontentloaded", timeout=30000)
-
-                            # Verificar se é download direto ou precisa confirmar
-                            if response and response.url and "download" in response.url:
-                                # Tentar pegar o conteúdo via fetch no contexto autenticado
-                                pass
-
-                            # Método alternativo: usar JavaScript fetch no contexto autenticado
-                            file_content = await download_page.evaluate(f"""
-                                async () => {{
-                                    try {{
-                                        const resp = await fetch('{download_url}', {{ credentials: 'include' }});
-                                        if (!resp.ok) return {{ error: 'HTTP ' + resp.status }};
-                                        const blob = await resp.blob();
-                                        return new Promise((resolve) => {{
-                                            const reader = new FileReader();
-                                            reader.onload = () => resolve({{ 
-                                                data: reader.result.split(',')[1],
-                                                size: blob.size,
-                                                type: blob.type
-                                            }});
-                                            reader.readAsDataURL(blob);
-                                        }});
-                                    }} catch(e) {{
-                                        return {{ error: e.message }};
-                                    }}
-                                }}
-                            """)
-
-                            await download_page.close()
-
-                            if file_content and not file_content.get("error"):
-                                dados["arquivos_novos"].append({
-                                    "nome": anexo_nome,
-                                    "file_id": file_id,
-                                    "tamanho": file_content.get("size", 0),
-                                    "tipo": file_content.get("type", ""),
-                                    "conteudo_base64": file_content.get("data", ""),
-                                    "turma": req.turma_nome,
-                                    "material": mat_nome
-                                })
-                                logger.info(f"[ClassroomV2] Download OK: {anexo_nome} ({file_content.get('size', 0)} bytes)")
-                            else:
-                                error_msg = file_content.get("error", "Erro desconhecido") if file_content else "Sem resposta"
-                                dados["erros"].append(f"Download falhou: {anexo_nome} - {error_msg}")
-                                logger.error(f"[ClassroomV2] Download falhou: {anexo_nome} - {error_msg}")
-
-                        except Exception as e:
-                            dados["erros"].append(f"Download erro: {anexo_nome} - {str(e)}")
-                            logger.error(f"[ClassroomV2] Erro download {anexo_nome}: {e}")
+                    if file_content and not file_content.get("error"):
+                        dados["arquivos_novos"].append({
+                            "nome": anexo_nome,
+                            "file_id": file_id,
+                            "tamanho": file_content.get("size", 0),
+                            "tipo": file_content.get("type", ""),
+                            "conteudo_base64": file_content.get("data", ""),
+                            "turma": req.turma_nome
+                        })
+                        logger.info(f"[ClassroomV2] Download OK: {anexo_nome} ({file_content.get('size', 0)} bytes)")
+                    else:
+                        error_msg = file_content.get("error", "Erro desconhecido") if file_content else "Sem resposta"
+                        dados["erros"].append(f"Download falhou: {anexo_nome} - {error_msg}")
+                        logger.error(f"[ClassroomV2] Download falhou: {anexo_nome} - {error_msg}")
 
                 except Exception as e:
-                    dados["erros"].append(f"Material '{mat_nome}': {str(e)}")
-                    logger.error(f"[ClassroomV2] Erro material {mat_nome}: {e}")
+                    dados["erros"].append(f"Download erro: {anexo_nome} - {str(e)}")
+                    logger.error(f"[ClassroomV2] Erro download {anexo_nome}: {e}")
 
         except Exception as e:
             logger.error(f"[ClassroomV2] Erro geral turma: {e}\n{traceback.format_exc()}")
