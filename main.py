@@ -121,7 +121,7 @@ class ScrapeResponse(BaseModel):
 app = FastAPI(
     title="Melissa Scraper API",
     description="API de scraping com Playwright para a Agente Melissa",
-    version="3.4.0"
+    version="3.5.0"
 )
 
 
@@ -165,10 +165,9 @@ async def google_login(page, email: str, password: str, max_retries: int = 3):
             await page.wait_for_timeout(4000)
 
             # Aguardar tela de senha (/challenge/pwd é NORMAL, não é CAPTCHA)
-            # Usar input[name="Passwd"] para evitar o campo hidden decoy do Google
-            password_input = page.locator('input[name="Passwd"], input[type="password"]:visible')
-            await password_input.first.wait_for(state="visible", timeout=15000)
-            await password_input.first.fill(password)
+            password_input = page.locator('input[type="password"]')
+            await password_input.wait_for(state="visible", timeout=15000)
+            await password_input.fill(password)
             await page.wait_for_timeout(500)
             await page.locator('#passwordNext button').click()
             await page.wait_for_timeout(5000)
@@ -558,34 +557,20 @@ async def scrape_superapp_async(req: ScrapeRequest) -> dict:
                     await page.wait_for_timeout(3000)
 
                 # Inserir senha
-                password_input = page.locator('input[type="password"]:visible')
-                await password_input.first.wait_for(state="visible", timeout=10000)
-                await password_input.first.fill(password)
-                logger.info("Senha preenchida no Layers")
+                password_input = page.locator('input[type="password"]')
+                await password_input.wait_for(state="visible", timeout=10000)
+                await password_input.fill(password)
                 await page.wait_for_timeout(500)
 
                 # Clicar Enter/Entrar
-                enter_btn = page.locator('button:has-text("Enter"), button:has-text("Entrar"), button[type="submit"]')
+                enter_btn = page.locator('button:has-text("Enter"), button:has-text("Entrar")')
                 if await enter_btn.count() > 0:
                     await enter_btn.first.click()
                     logger.info("Clicou Enter, aguardando login completar...")
-                else:
-                    # Tentar pressionar Enter como fallback
-                    await password_input.first.press("Enter")
-                    logger.info("Pressionou Enter no campo de senha")
-                await page.wait_for_timeout(8000)
+                    await page.wait_for_timeout(8000)
 
                 current_url = page.url
                 logger.info(f"URL após login: {current_url}")
-
-                # Se ainda está na tela de login, tentar novamente
-                if "sign-in" in current_url or "login" in current_url.lower():
-                    logger.warning(f"Ainda na tela de login: {current_url}")
-                    # Tentar navegar direto para a home
-                    await page.goto("https://liceu-jardim.layers.education/@liceu-jardim/", wait_until="domcontentloaded", timeout=30000)
-                    await page.wait_for_timeout(5000)
-                    current_url = page.url
-                    logger.info(f"URL após retry: {current_url}")
 
             # Verificar se logou com sucesso
             page_text = await page.evaluate("document.body.innerText")
@@ -1163,8 +1148,7 @@ async def scrape_roteiro_async(req: ScrapeRequest) -> dict:
 
                 # 4. PREENCHER SENHA NO POPUP
                 logger.info("[Roteiro] Preenchendo senha...")
-                # Usar input[name="Passwd"] para evitar o campo hidden decoy do Google
-                password_input = popup.locator('input[name="Passwd"], input[type="password"]:visible')
+                password_input = popup.locator('input[type="password"]')
                 await password_input.first.wait_for(state="visible", timeout=15000)
                 await password_input.first.fill(password)
                 await popup.wait_for_timeout(500)
@@ -1295,7 +1279,7 @@ def health():
     return {
         "status": "ok",
         "service": "melissa-scraper-playwright",
-        "version": "3.4.0",
+        "version": "3.5.0",
         "timestamp": datetime.now().isoformat(),
         "playwright": True,
         "async_jobs": True
@@ -1305,8 +1289,8 @@ def health():
 @app.get("/")
 def root():
     return {
-        "service": "Melissa Scraper API v3.4 (Fix Google Password + Layers Login)",
-        "version": "3.4.0",
+        "service": "Melissa Scraper API v3.5 (Revert login to v3.2 + Menu Fix + Timeout Fix)",
+        "version": "3.5.0",
         "docs": "/docs",
         "health": "/health",
         "endpoints": [
