@@ -323,38 +323,103 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 await page.wait_for_timeout(1000)
 
-            # 5. Expandir todos os materiais e coletar anexos
-            # Primeiro, pegar a lista de materiais (botões expandíveis)
+            # 5. DEBUG: capturar o que a página mostra
+            page_text = await page.evaluate("document.body.innerText")
+            page_url = page.url
+            logger.info(f"[ClassroomV2] URL atual: {page_url}")
+            logger.info(f"[ClassroomV2] Texto da página (500 chars): {page_text[:500]}")
+
+            # 5b. Expandir todos os materiais e coletar anexos
+            # Tentar múltiplos seletores para encontrar materiais
             materiais_info = await page.evaluate("""
                 () => {
                     const result = [];
-                    // Pegar todos os botões de material (role="button" com hint de material)
-                    const buttons = document.querySelectorAll('div[role="button"][data-stream-item-id]');
-                    buttons.forEach(btn => {
-                        const nome = btn.getAttribute('aria-label') || btn.textContent?.trim() || '';
-                        const id = btn.getAttribute('data-stream-item-id') || '';
-                        const expanded = btn.getAttribute('aria-expanded');
-                        result.push({ nome, id, expanded });
+                    const debug = { selectors_tried: [] };
+
+                    // Seletor 1: data-stream-item-id
+                    const s1 = document.querySelectorAll('div[role="button"][data-stream-item-id]');
+                    debug.selectors_tried.push({ selector: 'div[role=button][data-stream-item-id]', count: s1.length });
+                    s1.forEach(btn => {
+                        result.push({
+                            nome: btn.getAttribute('aria-label') || btn.textContent?.trim()?.substring(0, 100) || '',
+                            id: btn.getAttribute('data-stream-item-id') || '',
+                            expanded: btn.getAttribute('aria-expanded'),
+                            source: 's1'
+                        });
                     });
 
-                    // Fallback: pegar materiais por classe CSS
+                    // Seletor 2: aria-expanded (materiais expandíveis)
                     if (result.length === 0) {
-                        document.querySelectorAll('.asQXV, [jscontroller]').forEach(el => {
-                            const btn = el.querySelector('div[role="button"]');
-                            if (btn) {
-                                const nome = btn.textContent?.trim() || '';
-                                if (nome && nome.length > 3) {
-                                    result.push({ nome, id: '', expanded: btn.getAttribute('aria-expanded') });
-                                }
+                        const s2 = document.querySelectorAll('[aria-expanded]');
+                        debug.selectors_tried.push({ selector: '[aria-expanded]', count: s2.length });
+                        s2.forEach(el => {
+                            const nome = el.getAttribute('aria-label') || el.textContent?.trim()?.substring(0, 100) || '';
+                            if (nome && nome.length > 3) {
+                                result.push({ nome, id: '', expanded: el.getAttribute('aria-expanded'), source: 's2' });
                             }
                         });
                     }
 
-                    return result;
+                    // Seletor 3: role=treeitem (Classroom usa tree structure)
+                    if (result.length === 0) {
+                        const s3 = document.querySelectorAll('[role="treeitem"], [role="listitem"]');
+                        debug.selectors_tried.push({ selector: '[role=treeitem/listitem]', count: s3.length });
+                        s3.forEach(el => {
+                            const nome = el.textContent?.trim()?.substring(0, 100) || '';
+                            if (nome && nome.length > 3) {
+                                result.push({ nome, id: '', expanded: null, source: 's3' });
+                            }
+                        });
+                    }
+
+                    // Seletor 4: links de atividades/materiais
+                    if (result.length === 0) {
+                        const s4 = document.querySelectorAll('a[href*="/c/"][href*="/a/"], a[href*="/c/"][href*="/m/"], a[href*="/c/"][href*="/p/"]');
+                        debug.selectors_tried.push({ selector: 'a[href /c/ /a/ /m/ /p/]', count: s4.length });
+                        s4.forEach(a => {
+                            result.push({ nome: a.textContent?.trim()?.substring(0, 100) || '', id: a.href, expanded: null, source: 's4' });
+                        });
+                    }
+
+                    // Seletor 5: qualquer div com role=button
+                    if (result.length === 0) {
+                        const s5 = document.querySelectorAll('div[role="button"]');
+                        debug.selectors_tried.push({ selector: 'div[role=button]', count: s5.length });
+                        s5.forEach(btn => {
+                            const nome = btn.textContent?.trim()?.substring(0, 100) || '';
+                            if (nome && nome.length > 5 && !nome.includes('Google') && !nome.includes('Menu')) {
+                                result.push({ nome, id: '', expanded: btn.getAttribute('aria-expanded'), source: 's5' });
+                            }
+                        });
+                    }
+
+                    // Seletor 6: links do Drive diretamente na página
+                    const driveLinks = document.querySelectorAll('a[href*="drive.google.com"], a[href*="docs.google.com"]');
+                    debug.selectors_tried.push({ selector: 'drive/docs links', count: driveLinks.length });
+
+                    // Seletor 7: todos os links na página
+                    const allLinks = document.querySelectorAll('a[href]');
+                    debug.selectors_tried.push({ selector: 'all a[href]', count: allLinks.length });
+                    const linkSample = [];
+                    allLinks.forEach((a, i) => {
+                        if (i < 20) linkSample.push({ text: a.textContent?.trim()?.substring(0, 50), href: a.href?.substring(0, 80) });
+                    });
+                    debug.link_sample = linkSample;
+
+                    return { materiais: result, debug };
                 }
             """)
 
+            # Separar debug dos materiais
+            debug_info = materiais_info.get('debug', {})
+            materiais_info = materiais_info.get('materiais', [])
+
             logger.info(f"[ClassroomV2] {len(materiais_info)} materiais encontrados")
+            logger.info(f"[ClassroomV2] Debug seletores: {debug_info.get('selectors_tried', [])}")
+            logger.info(f"[ClassroomV2] Debug links sample: {debug_info.get('link_sample', [])[:5]}")
+
+            # Salvar debug no resultado para análise
+            dados['debug'] = debug_info
 
             # 6. Para cada material, expandir e coletar anexos
             for mat in materiais_info:
