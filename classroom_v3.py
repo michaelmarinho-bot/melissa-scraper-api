@@ -1,21 +1,22 @@
 """
 Classroom V3 — Endpoints fragmentados com download por tipo de arquivo
-Versão: 3.0.0
+Versão: 3.6.0 — Fix: reutilizar mesma aba para downloads (economia de memória)
 
 Endpoints:
   POST /scrape/classroom/turmas  - Lista todas as turmas do Classroom
   POST /scrape/classroom/turma   - Coleta materiais e arquivos de 1 turma (com download)
 
 Tipos de download suportados:
-  - Google Docs   → .docx (Arquivo → Baixar → Microsoft Word)
-  - Google Slides → .pptx (Arquivo → Baixar → Microsoft PowerPoint)
-  - Google Sheets → .xlsx (Arquivo → Baixar → Microsoft Excel)
+  - Google Docs   → .docx (export URL direto)
+  - Google Slides → .pptx (export URL direto)
+  - Google Sheets → .xlsx (export URL direto)
   - PDF           → .pdf  (Drive viewer → botão Baixar)
   - Imagem        → .png/.jpg original (Drive viewer → botão Baixar)
   - Office files  → formato original (Drive viewer → botão Baixar)
 
 Arquitetura:
   - Cada chamada abre e fecha o browser (1 turma = 1 browser = pouca memória)
+  - UMA ÚNICA aba de download é reutilizada para todos os arquivos (fix v3.6.0)
   - O n8n faz o inventário no Drive e orquestra as chamadas
   - A API faz scraping + download, retorna arquivos em base64
   - Nenhuma conversão de formato — tudo no formato original
@@ -166,6 +167,9 @@ async def criar_browser(p):
             "--disable-gpu",
             "--disable-blink-features=AutomationControlled",
             "--window-size=1280,800",
+            "--single-process",
+            "--disable-extensions",
+            "--disable-background-networking",
         ]
     )
     context = await browser.new_context(
@@ -180,17 +184,16 @@ async def criar_browser(p):
 
 # ============================================================
 # DOWNLOAD HELPERS — Por tipo de arquivo
+# Todas as funções agora recebem uma `page` existente e a REUTILIZAM
+# em vez de criar novas abas (fix v3.6.0 — economia de memória)
 # ============================================================
 
-async def download_drive_file(context, file_id: str, nome: str) -> dict:
+async def download_drive_file(page, file_id: str, nome: str) -> dict:
     """
     Download de arquivo do Drive (PDF, imagem, Office, etc.)
-    Abre no Drive viewer → clica no botão Baixar → captura download.
-    Formato original preservado.
+    REUTILIZA a page existente — navega, baixa, e limpa.
     """
-    page = None
     try:
-        page = await context.new_page()
         view_url = f"https://drive.google.com/file/d/{file_id}/view"
         logger.info(f"[ClassroomV3] download_drive_file: {nome} -> {view_url}")
 
@@ -198,16 +201,36 @@ async def download_drive_file(context, file_id: str, nome: str) -> dict:
         await page.wait_for_timeout(3000)
 
         # Procurar botão "Baixar" no viewer do Drive
-        # O botão tem hint="Baixar" conforme mapeado manualmente
         download_btn = page.locator('button:has-text("Baixar"), [aria-label*="Baixar"], [aria-label*="Download"], [data-tooltip*="Baixar"], [data-tooltip*="Download"]')
         btn_count = await download_btn.count()
         logger.info(f"[ClassroomV3] Botões de download encontrados: {btn_count}")
 
         if btn_count > 0:
-            logger.info(f"[ClassroomV3] Tentando expect_download com clique no botão...")
+            # Usar expect_download para capturar o arquivo
+            try:
+                async with page.expect_download(timeout=30000) as download_info:
+                    await download_btn.first.click()
+                download = await download_info.value
+                # Salvar em temp e ler
+                tmp_path = f"/tmp/classroom_dl_{uuid.uuid4().hex[:8]}"
+                await download.save_as(tmp_path)
+                suggested_name = download.suggested_filename or nome
+                with open(tmp_path, "rb") as f:
+                    content = f.read()
+                os.remove(tmp_path)
+                result = {
+                    "data": base64.b64encode(content).decode(),
+                    "size": len(content),
+                    "filename": suggested_name
+                }
+                del content  # Liberar memória imediatamente
+                gc.collect()
+                return result
+            except Exception as e:
+                logger.warning(f"[ClassroomV3] expect_download falhou: {e}, tentando fallback...")
 
+        # Fallback: procurar via JS
         if btn_count == 0:
-            # Fallback: procurar via JS
             found = await page.evaluate("""
                 () => {
                     const btns = document.querySelectorAll('button, [role="button"]');
@@ -226,85 +249,53 @@ async def download_drive_file(context, file_id: str, nome: str) -> dict:
                 }
             """)
             if not found:
-                return {"error": "Botão Baixar não encontrado no Drive viewer"}
-            # Esperar download iniciar
-            await page.wait_for_timeout(5000)
-        else:
-            # Usar expect_download para capturar o arquivo
-            try:
-                async with page.expect_download(timeout=30000) as download_info:
-                    await download_btn.first.click()
-                download = await download_info.value
-                # Salvar em temp e ler
-                tmp_path = f"/tmp/classroom_dl_{uuid.uuid4().hex[:8]}"
-                await download.save_as(tmp_path)
-                suggested_name = download.suggested_filename or nome
-                with open(tmp_path, "rb") as f:
-                    content = f.read()
-                os.remove(tmp_path)
-                return {
-                    "data": base64.b64encode(content).decode(),
-                    "size": len(content),
-                    "filename": suggested_name
-                }
-            except Exception as e:
-                logger.warning(f"[ClassroomV3] expect_download falhou: {e}, tentando fallback...")
-                # Fallback: esperar a navegação para URL de download
-                await page.wait_for_timeout(5000)
+                # Fallback final: URL direta de download
+                logger.info(f"[ClassroomV3] Tentando URL direta de download...")
+                export_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t"
+                try:
+                    async with page.expect_download(timeout=30000) as download_info:
+                        await page.goto(export_url)
+                    download = await download_info.value
+                    tmp_path = f"/tmp/classroom_dl_{uuid.uuid4().hex[:8]}"
+                    await download.save_as(tmp_path)
+                    suggested_name = download.suggested_filename or nome
+                    with open(tmp_path, "rb") as f:
+                        content = f.read()
+                    os.remove(tmp_path)
+                    result = {
+                        "data": base64.b64encode(content).decode(),
+                        "size": len(content),
+                        "filename": suggested_name
+                    }
+                    del content
+                    gc.collect()
+                    return result
+                except Exception as e2:
+                    logger.error(f"[ClassroomV3] Fallback download também falhou: {e2}")
+                    return {"error": f"Download falhou: {e2}"}
 
-        # Fallback final: tentar URL direta de download
-        export_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t"
-        dl_page = await context.new_page()
-        try:
-            async with dl_page.expect_download(timeout=30000) as download_info:
-                await dl_page.goto(export_url)
-            download = await download_info.value
-            tmp_path = f"/tmp/classroom_dl_{uuid.uuid4().hex[:8]}"
-            await download.save_as(tmp_path)
-            suggested_name = download.suggested_filename or nome
-            with open(tmp_path, "rb") as f:
-                content = f.read()
-            os.remove(tmp_path)
-            return {
-                "data": base64.b64encode(content).decode(),
-                "size": len(content),
-                "filename": suggested_name
-            }
-        except Exception as e2:
-            logger.error(f"[ClassroomV3] Fallback download também falhou: {e2}")
-            return {"error": f"Download falhou: {e2}"}
-        finally:
-            await dl_page.close()
+        # Se clicou via JS, esperar download
+        await page.wait_for_timeout(5000)
+        return {"error": "Download via JS clicado mas não capturado"}
 
     except Exception as e:
         logger.error(f"[ClassroomV3] download_drive_file erro: {e}")
         return {"error": str(e)}
-    finally:
-        if page:
-            await page.close()
 
 
-async def download_google_doc(context, file_id: str, nome: str) -> dict:
+async def download_google_doc(page, file_id: str, nome: str) -> dict:
     """
-    Download de Google Docs como .docx (formato original).
-    Abre o doc → Arquivo → Baixar → Microsoft Word (.docx)
+    Download de Google Docs como .docx via export URL direto.
+    REUTILIZA a page existente.
     """
-    page = None
     try:
-        page = await context.new_page()
-        doc_url = f"https://docs.google.com/document/d/{file_id}/edit"
-        logger.info(f"[ClassroomV3] download_google_doc: {nome} -> {doc_url}")
-
-        await page.goto(doc_url, wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(5000)
-
-        # Tentar via export URL primeiro (mais confiável no Playwright)
-        # Google Docs export como docx
+        # Export URL direto — mais confiável e usa menos memória
         export_url = f"https://docs.google.com/document/d/{file_id}/export?format=docx"
+        logger.info(f"[ClassroomV3] download_google_doc: {nome} -> export docx")
+
         try:
-            dl_page = await context.new_page()
-            async with dl_page.expect_download(timeout=30000) as download_info:
-                await dl_page.goto(export_url)
+            async with page.expect_download(timeout=30000) as download_info:
+                await page.goto(export_url)
             download = await download_info.value
             tmp_path = f"/tmp/classroom_dl_{uuid.uuid4().hex[:8]}"
             await download.save_as(tmp_path)
@@ -312,35 +303,34 @@ async def download_google_doc(context, file_id: str, nome: str) -> dict:
             with open(tmp_path, "rb") as f:
                 content = f.read()
             os.remove(tmp_path)
-            await dl_page.close()
             if len(content) > 0:
-                return {
+                result = {
                     "data": base64.b64encode(content).decode(),
                     "size": len(content),
                     "filename": suggested_name
                 }
+                del content
+                gc.collect()
+                return result
         except Exception as e:
             logger.warning(f"[ClassroomV3] Export URL falhou para Google Doc: {e}")
-            try:
-                await dl_page.close()
-            except:
-                pass
 
-        # Fallback: usar menu Arquivo → Baixar → Microsoft Word
+        # Fallback: abrir editor e usar menu Arquivo → Baixar
+        doc_url = f"https://docs.google.com/document/d/{file_id}/edit"
+        await page.goto(doc_url, wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(5000)
+
         try:
-            # Clicar em Arquivo
             file_menu = page.locator('#docs-file-menu, [aria-label="Arquivo"]')
             if await file_menu.count() > 0:
                 await file_menu.first.click()
                 await page.wait_for_timeout(1000)
 
-                # Clicar em Baixar/Download
                 download_menu = page.locator('[aria-label*="Baixar"], [aria-label*="Download"], :text("Baixar")')
                 if await download_menu.count() > 0:
                     await download_menu.first.click()
                     await page.wait_for_timeout(1000)
 
-                    # Clicar em Microsoft Word (.docx)
                     async with page.expect_download(timeout=30000) as download_info:
                         docx_option = page.locator(':text("Microsoft Word"), :text(".docx")')
                         if await docx_option.count() > 0:
@@ -353,11 +343,14 @@ async def download_google_doc(context, file_id: str, nome: str) -> dict:
                     with open(tmp_path, "rb") as f:
                         content = f.read()
                     os.remove(tmp_path)
-                    return {
+                    result = {
                         "data": base64.b64encode(content).decode(),
                         "size": len(content),
                         "filename": suggested_name
                     }
+                    del content
+                    gc.collect()
+                    return result
         except Exception as e:
             logger.error(f"[ClassroomV3] Menu download falhou para Google Doc: {e}")
 
@@ -366,21 +359,15 @@ async def download_google_doc(context, file_id: str, nome: str) -> dict:
     except Exception as e:
         logger.error(f"[ClassroomV3] download_google_doc erro: {e}")
         return {"error": str(e)}
-    finally:
-        if page:
-            await page.close()
 
 
-async def download_google_slides(context, file_id: str, nome: str) -> dict:
+async def download_google_slides(page, file_id: str, nome: str) -> dict:
     """
-    Download de Google Slides como .pptx (formato original).
-    Tenta export URL primeiro, fallback para menu Arquivo → Baixar.
+    Download de Google Slides como .pptx via export URL direto.
+    REUTILIZA a page existente.
     """
-    page = None
     try:
-        page = await context.new_page()
-
-        # Tentar via export URL (mais confiável)
+        # Export URL direto
         export_url = f"https://docs.google.com/presentation/d/{file_id}/export?format=pptx"
         logger.info(f"[ClassroomV3] download_google_slides: {nome} -> export pptx")
 
@@ -395,11 +382,14 @@ async def download_google_slides(context, file_id: str, nome: str) -> dict:
                 content = f.read()
             os.remove(tmp_path)
             if len(content) > 0:
-                return {
+                result = {
                     "data": base64.b64encode(content).decode(),
                     "size": len(content),
                     "filename": suggested_name
                 }
+                del content
+                gc.collect()
+                return result
         except Exception as e:
             logger.warning(f"[ClassroomV3] Export URL falhou para Slides: {e}")
 
@@ -431,11 +421,14 @@ async def download_google_slides(context, file_id: str, nome: str) -> dict:
                     with open(tmp_path, "rb") as f:
                         content = f.read()
                     os.remove(tmp_path)
-                    return {
+                    result = {
                         "data": base64.b64encode(content).decode(),
                         "size": len(content),
                         "filename": suggested_name
                     }
+                    del content
+                    gc.collect()
+                    return result
         except Exception as e:
             logger.error(f"[ClassroomV3] Menu download falhou para Slides: {e}")
 
@@ -444,21 +437,15 @@ async def download_google_slides(context, file_id: str, nome: str) -> dict:
     except Exception as e:
         logger.error(f"[ClassroomV3] download_google_slides erro: {e}")
         return {"error": str(e)}
-    finally:
-        if page:
-            await page.close()
 
 
-async def download_google_sheets(context, file_id: str, nome: str) -> dict:
+async def download_google_sheets(page, file_id: str, nome: str) -> dict:
     """
-    Download de Google Sheets como .xlsx (formato original).
-    Tenta export URL primeiro, fallback para menu Arquivo → Baixar.
+    Download de Google Sheets como .xlsx via export URL direto.
+    REUTILIZA a page existente.
     """
-    page = None
     try:
-        page = await context.new_page()
-
-        # Tentar via export URL
+        # Export URL direto
         export_url = f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=xlsx"
         logger.info(f"[ClassroomV3] download_google_sheets: {nome} -> export xlsx")
 
@@ -473,11 +460,14 @@ async def download_google_sheets(context, file_id: str, nome: str) -> dict:
                 content = f.read()
             os.remove(tmp_path)
             if len(content) > 0:
-                return {
+                result = {
                     "data": base64.b64encode(content).decode(),
                     "size": len(content),
                     "filename": suggested_name
                 }
+                del content
+                gc.collect()
+                return result
         except Exception as e:
             logger.warning(f"[ClassroomV3] Export URL falhou para Sheets: {e}")
 
@@ -509,11 +499,14 @@ async def download_google_sheets(context, file_id: str, nome: str) -> dict:
                     with open(tmp_path, "rb") as f:
                         content = f.read()
                     os.remove(tmp_path)
-                    return {
+                    result = {
                         "data": base64.b64encode(content).decode(),
                         "size": len(content),
                         "filename": suggested_name
                     }
+                    del content
+                    gc.collect()
+                    return result
         except Exception as e:
             logger.error(f"[ClassroomV3] Menu download falhou para Sheets: {e}")
 
@@ -522,14 +515,12 @@ async def download_google_sheets(context, file_id: str, nome: str) -> dict:
     except Exception as e:
         logger.error(f"[ClassroomV3] download_google_sheets erro: {e}")
         return {"error": str(e)}
-    finally:
-        if page:
-            await page.close()
 
 
-async def download_arquivo(context, anexo: dict) -> dict:
+async def download_arquivo(page, anexo: dict) -> dict:
     """
     Router de download — escolhe a estratégia correta por tipo de arquivo.
+    REUTILIZA a mesma page para todos os downloads.
     Retorna dict com data (base64), size, filename ou error.
     """
     file_id = anexo.get("fileId", "")
@@ -542,14 +533,14 @@ async def download_arquivo(context, anexo: dict) -> dict:
     logger.info(f"[ClassroomV3] Download: {nome} | tipo={tipo} | id={file_id}")
 
     if tipo == "google_doc":
-        return await download_google_doc(context, file_id, nome)
+        return await download_google_doc(page, file_id, nome)
     elif tipo == "google_slides":
-        return await download_google_slides(context, file_id, nome)
+        return await download_google_slides(page, file_id, nome)
     elif tipo == "google_sheets":
-        return await download_google_sheets(context, file_id, nome)
+        return await download_google_sheets(page, file_id, nome)
     else:
         # drive_file: PDF, imagem, Office, etc — formato original
-        return await download_drive_file(context, file_id, nome)
+        return await download_drive_file(page, file_id, nome)
 
 
 # ============================================================
@@ -639,6 +630,9 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
     Coleta materiais, textos e arquivos de 1 turma.
     Compara com arquivos_existentes (inventário do Drive) e só baixa os novos.
     Retorna arquivos em base64 para o n8n fazer upload.
+    
+    v3.6.0: Reutiliza UMA ÚNICA aba de download para todos os arquivos.
+    Isso reduz drasticamente o uso de memória (de N abas para 1 aba).
     """
     from playwright.async_api import async_playwright
 
@@ -691,7 +685,6 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
                 await page.wait_for_timeout(1000)
 
             # 4. Coletar materiais: expandir e extrair info
-            # Primeiro, pegar a lista de materiais (role="button" com hint de material)
             materiais_info = await page.evaluate("""
                 () => {
                     const result = [];
@@ -764,8 +757,6 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
             textos_materiais = await page.evaluate("""
                 () => {
                     const textos = [];
-                    // Procurar por divs de conteúdo expandido que contêm texto
-                    // No Classroom, o texto aparece abaixo do material quando expandido
                     const contentDivs = document.querySelectorAll('.OHJHx, .z3vRcc, .asQXV');
                     contentDivs.forEach(div => {
                         const text = div.textContent?.trim();
@@ -773,7 +764,6 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
                             textos.push(text.substring(0, 2000));
                         }
                     });
-                    // Fallback: pegar texto visível que não é de UI
                     if (textos.length === 0) {
                         const allText = document.body.innerText;
                         textos.push(allText.substring(0, 5000));
@@ -784,7 +774,6 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
             dados["textos"] = textos_materiais
 
             # 7. Coletar TODOS os anexos (links do Drive/Docs/Slides)
-            # Inclui detecção do tipo pelo hint "Anexo: {tipo}: {nome}"
             anexos_todos = await page.evaluate("""
                 () => {
                     const anexos = [];
@@ -795,7 +784,6 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
                         const nome = a.textContent?.trim()?.split('\\n')[0] || '';
                         const url = a.href || '';
                         
-                        // Extrair tipo do hint: "Anexo: Google Docs: nome" ou "Anexo: Imagem: nome"
                         let tipo = 'drive_file';
                         const hintLower = hint.toLowerCase();
                         if (hintLower.includes('google docs') || hintLower.includes('documento')) tipo = 'google_doc';
@@ -804,7 +792,6 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
                         else if (hintLower.includes('imagem') || hintLower.includes('image')) tipo = 'imagem';
                         else if (hintLower.includes('pdf')) tipo = 'pdf';
                         
-                        // Também detectar pelo URL
                         if (url.includes('docs.google.com/document')) tipo = 'google_doc';
                         else if (url.includes('docs.google.com/presentation') || url.includes('slides.google.com')) tipo = 'google_slides';
                         else if (url.includes('docs.google.com/spreadsheets')) tipo = 'google_sheets';
@@ -860,6 +847,10 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
                 })
 
             # 8. Para cada anexo: verificar inventário → baixar se novo
+            # >>> FIX v3.6.0: Criar UMA ÚNICA aba de download e reutilizar <<<
+            download_page = None
+            arquivos_para_baixar = []
+
             for anexo in anexos_todos:
                 anexo_nome = anexo.get("nome", "")
                 file_id = anexo.get("fileId", "")
@@ -873,30 +864,57 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
                     dados["arquivos_existentes"].append(anexo_nome)
                     continue
 
-                # Baixar arquivo novo
-                logger.info(f"[ClassroomV3] Baixando novo: {anexo_nome}")
-                try:
-                    result = await download_arquivo(context, anexo)
+                arquivos_para_baixar.append(anexo)
 
-                    if result and not result.get("error") and result.get("size", 0) > 0:
-                        dados["arquivos_novos"].append({
-                            "nome": anexo_nome,
-                            "file_id": file_id,
-                            "tipo": anexo.get("tipo", ""),
-                            "tamanho": result.get("size", 0),
-                            "filename": result.get("filename", anexo_nome),
-                            "conteudo_base64": result.get("data", ""),
-                            "turma": req.turma_nome
-                        })
-                        logger.info(f"[ClassroomV3] OK: {anexo_nome} ({result.get('size', 0)} bytes) -> {result.get('filename', '')}")
-                    else:
-                        error_msg = result.get("error", "Erro desconhecido") if result else "Sem resposta"
-                        dados["erros"].append(f"Download falhou: {anexo_nome} - {error_msg}")
-                        logger.error(f"[ClassroomV3] Falhou: {anexo_nome} - {error_msg}")
+            if arquivos_para_baixar:
+                logger.info(f"[ClassroomV3] {len(arquivos_para_baixar)} arquivos para baixar")
+                
+                # Criar UMA aba de download
+                download_page = await context.new_page()
+                logger.info("[ClassroomV3] Aba de download criada (será reutilizada para todos os arquivos)")
 
-                except Exception as e:
-                    dados["erros"].append(f"Erro download: {anexo_nome} - {str(e)}")
-                    logger.error(f"[ClassroomV3] Erro: {anexo_nome} - {e}")
+                for i, anexo in enumerate(arquivos_para_baixar):
+                    anexo_nome = anexo.get("nome", "")
+                    file_id = anexo.get("fileId", "")
+
+                    logger.info(f"[ClassroomV3] Baixando [{i+1}/{len(arquivos_para_baixar)}]: {anexo_nome}")
+                    try:
+                        # Reutilizar a MESMA aba para cada download
+                        result = await download_arquivo(download_page, anexo)
+
+                        if result and not result.get("error") and result.get("size", 0) > 0:
+                            dados["arquivos_novos"].append({
+                                "nome": anexo_nome,
+                                "file_id": file_id,
+                                "tipo": anexo.get("tipo", ""),
+                                "tamanho": result.get("size", 0),
+                                "filename": result.get("filename", anexo_nome),
+                                "conteudo_base64": result.get("data", ""),
+                                "turma": req.turma_nome
+                            })
+                            logger.info(f"[ClassroomV3] Download OK: {anexo_nome} | {result.get('size', 0)} bytes | {result.get('filename', '')}")
+                        else:
+                            error_msg = result.get("error", "Erro desconhecido") if result else "Sem resposta"
+                            dados["erros"].append(f"Download falhou: {anexo_nome} - {error_msg}")
+                            logger.error(f"[ClassroomV3] Falhou: {anexo_nome} - {error_msg}")
+
+                    except Exception as e:
+                        dados["erros"].append(f"Erro download: {anexo_nome} - {str(e)}")
+                        logger.error(f"[ClassroomV3] Erro: {anexo_nome} - {e}")
+
+                    # Forçar limpeza de memória após cada download
+                    gc.collect()
+                    logger.info(f"[ClassroomV3] gc.collect() após download {i+1}")
+
+                # Fechar a aba de download no final
+                if download_page:
+                    try:
+                        await download_page.close()
+                        logger.info("[ClassroomV3] Aba de download fechada")
+                    except:
+                        pass
+            else:
+                logger.info("[ClassroomV3] Nenhum arquivo novo para baixar")
 
         except Exception as e:
             logger.error(f"[ClassroomV3] Erro geral turma: {e}\n{traceback.format_exc()}")
