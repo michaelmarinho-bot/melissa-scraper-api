@@ -415,7 +415,7 @@ async def scrape_classroom_async(req: ScrapeRequest) -> dict:
                             await page.wait_for_timeout(2000)
 
                             # Extrair detalhes da atividade
-                            detalhes = await page.evaluate("""
+                            detalhes = await page.evaluate(r"""
                                 () => {
                                     const titulo = document.querySelector('.YVvGBb, h1, .onkcGd')?.textContent?.trim() || '';
                                     const descricao = document.querySelector('.oKOVhd, .CkGfWc, [data-region="instructions"]')?.textContent?.trim() || '';

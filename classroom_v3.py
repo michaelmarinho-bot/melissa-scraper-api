@@ -158,7 +158,7 @@ async def google_login(page, email: str, password: str, max_retries: int = 3):
 async def criar_browser(p):
     """Cria browser com config anti-detecção e accept_downloads habilitado."""
     browser = await p.chromium.launch(
-        headless=False,
+        headless=True,
         args=[
             "--no-sandbox",
             "--disable-setuid-sandbox",
@@ -202,6 +202,9 @@ async def download_drive_file(context, file_id: str, nome: str) -> dict:
         download_btn = page.locator('button:has-text("Baixar"), [aria-label*="Baixar"], [aria-label*="Download"], [data-tooltip*="Baixar"], [data-tooltip*="Download"]')
         btn_count = await download_btn.count()
         logger.info(f"[ClassroomV3] Botões de download encontrados: {btn_count}")
+
+        if btn_count > 0:
+            logger.info(f"[ClassroomV3] Tentando expect_download com clique no botão...")
 
         if btn_count == 0:
             # Fallback: procurar via JS
