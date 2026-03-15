@@ -121,7 +121,7 @@ class ScrapeResponse(BaseModel):
 app = FastAPI(
     title="Melissa Scraper API",
     description="API de scraping com Playwright para a Agente Melissa",
-    version="3.2.0"
+    version="3.3.0"
 )
 
 
@@ -1279,7 +1279,7 @@ def health():
     return {
         "status": "ok",
         "service": "melissa-scraper-playwright",
-        "version": "3.2.0",
+        "version": "3.3.0",
         "timestamp": datetime.now().isoformat(),
         "playwright": True,
         "async_jobs": True
@@ -1289,8 +1289,8 @@ def health():
 @app.get("/")
 def root():
     return {
-        "service": "Melissa Scraper API v3.2 (Playwright + Async Jobs + Memory Optimized)",
-        "version": "3.2.0",
+        "service": "Melissa Scraper API v3.3 (Playwright + Async Jobs + Menu Fix)",
+        "version": "3.3.0",
         "docs": "/docs",
         "health": "/health",
         "endpoints": [
