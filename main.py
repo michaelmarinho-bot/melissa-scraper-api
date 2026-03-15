@@ -585,14 +585,21 @@ async def scrape_superapp_async(req: ScrapeRequest) -> dict:
             # ========================================
             logger.info("Acessando Notas Acadêmicas...")
             try:
-                # Clicar em "Gradebooks" no menu lateral
-                gradebooks_link = page.locator('a:has-text("Gradebooks"), a:has-text("Notas Acadêmicas")')
+                # Clicar em "Notas Acadêmicas" no menu lateral
+                gradebooks_link = page.locator('text="Notas Acadêmicas"').first
                 if await gradebooks_link.count() > 0:
-                    await gradebooks_link.first.click()
-                    logger.info("Clicou Gradebooks no menu")
+                    await gradebooks_link.click()
+                    logger.info("Clicou Notas Acadêmicas no menu")
                     await page.wait_for_timeout(8000)
                 else:
-                    logger.warning("Link Gradebooks não encontrado no menu")
+                    # Tentar alternativas
+                    alt_link = page.locator('a:has-text("Gradebooks"), a:has-text("Notas"), div:has-text("Notas Acadêmicas"), span:has-text("Notas Acadêmicas")')
+                    if await alt_link.count() > 0:
+                        await alt_link.first.click()
+                        logger.info("Clicou Notas via seletor alternativo")
+                        await page.wait_for_timeout(8000)
+                    else:
+                        logger.warning("Link Notas Acadêmicas não encontrado no menu")
 
                 # Clicar em "Ver notas" dentro do iframe (Playwright click)
                 notas_fl = page.frame_locator('iframe[src*="layers-notas-academicas"]')
@@ -724,12 +731,18 @@ async def scrape_superapp_async(req: ScrapeRequest) -> dict:
             # ========================================
             logger.info("Acessando Registros Acadêmicos...")
             try:
-                # Clicar em "Academic Records" no menu lateral
-                records_link = page.locator('a:has-text("Academic Records"), a:has-text("Registros Acadêmicos")')
+                # Clicar em "Registros Acadêmicos" no menu lateral
+                records_link = page.locator('text="Registros Acadêmicos"').first
                 if await records_link.count() > 0:
-                    await records_link.first.click()
-                    logger.info("Clicou Academic Records no menu")
+                    await records_link.click()
+                    logger.info("Clicou Registros Acadêmicos no menu")
                     await page.wait_for_timeout(5000)
+                else:
+                    alt_link = page.locator('a:has-text("Academic Records"), a:has-text("Registros"), div:has-text("Registros Acadêmicos"), span:has-text("Registros Acadêmicos")')
+                    if await alt_link.count() > 0:
+                        await alt_link.first.click()
+                        logger.info("Clicou Registros via seletor alternativo")
+                        await page.wait_for_timeout(5000)
 
                 # Os registros estão no iframe layers-registros-academicos
                 reg_frame = page.frame_locator('iframe[src*="layers-registros-academicos"]')
