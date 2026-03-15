@@ -77,6 +77,151 @@ def verificar_auth(authorization: str = Header(None)):
         raise HTTPException(status_code=401, detail="Chave de API inválida")
 
 
+async def _download_via_export(context, export_url: str, logger) -> dict:
+    """Download via URL de export (Google Docs/Slides/Sheets ou Drive export).
+    Abre nova aba no mesmo contexto autenticado, navega para a URL de export
+    e captura o conteúdo via fetch."""
+    download_page = None
+    try:
+        download_page = await context.new_page()
+        await download_page.goto(export_url, wait_until="domcontentloaded", timeout=30000)
+        await download_page.wait_for_timeout(2000)
+
+        file_content = await download_page.evaluate(f"""
+            async () => {{
+                try {{
+                    const resp = await fetch('{export_url}', {{ credentials: 'include', redirect: 'follow' }});
+                    if (!resp.ok) return {{ error: 'HTTP ' + resp.status }};
+                    const blob = await resp.blob();
+                    return new Promise((resolve) => {{
+                        const reader = new FileReader();
+                        reader.onload = () => resolve({{ 
+                            data: reader.result.split(',')[1],
+                            size: blob.size,
+                            type: blob.type
+                        }});
+                        reader.readAsDataURL(blob);
+                    }});
+                }} catch(e) {{
+                    return {{ error: e.message }};
+                }}
+            }}
+        """)
+        return file_content or {"error": "Sem resposta"}
+    except Exception as e:
+        logger.error(f"[ClassroomV2] _download_via_export erro: {e}")
+        return {"error": str(e)}
+    finally:
+        if download_page:
+            await download_page.close()
+
+
+async def _download_via_button(context, view_url: str, logger) -> dict:
+    """Download abrindo o arquivo no viewer e clicando no botão de download.
+    Funciona para PDFs, Excel, PPT, Word, imagens no Google Drive viewer."""
+    download_page = None
+    try:
+        download_page = await context.new_page()
+        
+        # Configurar handler de download ANTES de navegar
+        download_data = {"path": None, "error": None}
+        
+        async def handle_download(download):
+            try:
+                path = await download.path()
+                download_data["path"] = str(path)
+                download_data["suggested"] = download.suggested_filename
+            except Exception as e:
+                download_data["error"] = str(e)
+        
+        download_page.on("download", handle_download)
+        
+        await download_page.goto(view_url, wait_until="domcontentloaded", timeout=30000)
+        await download_page.wait_for_timeout(3000)
+        
+        # Tentar encontrar e clicar no botão de download
+        # Estratégia 1: Botão de download com aria-label
+        download_btn = download_page.locator('[aria-label*="ownload"], [aria-label*="aixar"], [aria-label*="Download"]')
+        if await download_btn.count() > 0:
+            await download_btn.first.click()
+            await download_page.wait_for_timeout(5000)
+        else:
+            # Estratégia 2: Botão com ícone de download (seta para baixo)
+            download_btn2 = download_page.locator('[data-tooltip*="ownload"], [data-tooltip*="aixar"]')
+            if await download_btn2.count() > 0:
+                await download_btn2.first.click()
+                await download_page.wait_for_timeout(5000)
+            else:
+                # Estratégia 3: Usar atalho Ctrl+S ou menu
+                # Tentar via JavaScript - procurar qualquer botão com ícone de download
+                clicked = await download_page.evaluate("""
+                    () => {
+                        // Procurar por botões com texto/aria de download
+                        const btns = document.querySelectorAll('button, [role="button"], a');
+                        for (const btn of btns) {
+                            const label = (btn.getAttribute('aria-label') || '').toLowerCase();
+                            const tooltip = (btn.getAttribute('data-tooltip') || '').toLowerCase();
+                            const text = (btn.textContent || '').toLowerCase();
+                            if (label.includes('download') || label.includes('baixar') || 
+                                tooltip.includes('download') || tooltip.includes('baixar') ||
+                                label.includes('fazer o download')) {
+                                btn.click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+                """)
+                if clicked:
+                    await download_page.wait_for_timeout(5000)
+                else:
+                    return {"error": "Botão de download não encontrado"}
+        
+        # Verificar se o download foi capturado
+        if download_data["path"]:
+            import base64 as b64
+            with open(download_data["path"], "rb") as f:
+                content = f.read()
+            return {
+                "data": b64.b64encode(content).decode(),
+                "size": len(content),
+                "type": "application/octet-stream",
+                "filename": download_data.get("suggested", "")
+            }
+        
+        # Se não capturou download, tentar via fetch como fallback
+        current_url = download_page.url
+        file_content = await download_page.evaluate(f"""
+            async () => {{
+                try {{
+                    const resp = await fetch('{current_url}', {{ credentials: 'include' }});
+                    if (!resp.ok) return {{ error: 'HTTP ' + resp.status }};
+                    const blob = await resp.blob();
+                    if (blob.type.startsWith('text/html')) return {{ error: 'Retornou HTML, não arquivo' }};
+                    return new Promise((resolve) => {{
+                        const reader = new FileReader();
+                        reader.onload = () => resolve({{ 
+                            data: reader.result.split(',')[1],
+                            size: blob.size,
+                            type: blob.type
+                        }});
+                        reader.readAsDataURL(blob);
+                    }});
+                }} catch(e) {{
+                    return {{ error: e.message }};
+                }}
+            }}
+        """)
+        return file_content or {"error": "Sem resposta"}
+        
+    except Exception as e:
+        logger.error(f"[ClassroomV2] _download_via_button erro: {e}")
+        return {"error": str(e)}
+    finally:
+        if download_page:
+            await download_page.close()
+
+
 def create_classroom_job(fonte: str) -> str:
     job_id = str(uuid.uuid4())[:8]
     classroom_jobs[job_id] = {
@@ -396,13 +541,16 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
             await page.wait_for_timeout(3000)
 
             # Agora coletar TODOS os links do Drive/Docs/Slides de uma vez
+            # Inclui detecção do tipo de arquivo pela URL
             anexos_todos = await page.evaluate("""
                 () => {
                     const anexos = [];
                     const seletores = [
                         'a[href*="drive.google.com/file"]',
                         'a[href*="drive.google.com/open"]', 
-                        'a[href*="docs.google.com"]',
+                        'a[href*="docs.google.com/document"]',
+                        'a[href*="docs.google.com/presentation"]',
+                        'a[href*="docs.google.com/spreadsheets"]',
                         'a[href*="slides.google.com"]',
                         'a[href*="drive.google.com/drive/folders"]'
                     ];
@@ -414,8 +562,16 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
                         if (url && nome && nome !== 'Pasta da turma no Google Drive') {
                             const match = url.match(/\/d\/([a-zA-Z0-9_-]+)/);
                             const fileId = match ? match[1] : '';
-                            if (fileId && !anexos.find(x => x.fileId === fileId)) {
-                                anexos.push({ nome, url, fileId });
+                            
+                            // Detectar tipo pelo URL
+                            let tipo = 'drive_file';  // PDF, Excel, PPT, Word, imagem etc
+                            if (url.includes('docs.google.com/document')) tipo = 'google_doc';
+                            else if (url.includes('docs.google.com/presentation') || url.includes('slides.google.com')) tipo = 'google_slides';
+                            else if (url.includes('docs.google.com/spreadsheets')) tipo = 'google_sheets';
+                            else if (url.includes('drive.google.com/drive/folders')) tipo = 'folder';
+                            
+                            if (fileId && !anexos.find(x => x.fileId === fileId) && tipo !== 'folder') {
+                                anexos.push({ nome, url, fileId, tipo });
                             }
                         }
                     });
@@ -425,7 +581,7 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
 
             logger.info(f"[ClassroomV2] {len(anexos_todos)} anexos encontrados no total")
             for a in anexos_todos:
-                logger.info(f"[ClassroomV2]   Anexo: {a['nome']} | fileId={a['fileId']}")
+                logger.info(f"[ClassroomV2]   Anexo: {a['nome']} | tipo={a['tipo']} | fileId={a['fileId']}")
 
             # Montar materiais com seus anexos
             for mat in materiais_info:
@@ -439,6 +595,7 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
             for anexo in anexos_todos:
                 anexo_nome = anexo.get("nome", "")
                 file_id = anexo.get("fileId", "")
+                tipo = anexo.get("tipo", "drive_file")
 
                 if not file_id:
                     continue
@@ -449,78 +606,50 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
                     dados["arquivos_existentes"].append(anexo_nome)
                     continue
 
-                # Baixar arquivo novo
-                logger.info(f"[ClassroomV2] Baixando: {anexo_nome} (ID: {file_id})")
+                # Baixar arquivo novo - estratégia por tipo
+                logger.info(f"[ClassroomV2] Baixando: {anexo_nome} (tipo={tipo}, ID: {file_id})")
                 try:
-                    download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+                    file_content = None
 
-                    # Abrir nova aba no mesmo contexto autenticado
-                    download_page = await context.new_page()
-                    await download_page.goto(download_url, wait_until="domcontentloaded", timeout=30000)
-                    await download_page.wait_for_timeout(2000)
+                    if tipo == 'google_doc':
+                        # Google Docs -> exportar como PDF
+                        export_url = f"https://docs.google.com/document/d/{file_id}/export?format=pdf"
+                        file_content = await _download_via_export(context, export_url, logger)
+                        if not file_content or file_content.get("error"):
+                            # Fallback: abrir e clicar no botão de download
+                            file_content = await _download_via_button(context, f"https://docs.google.com/document/d/{file_id}/view", logger)
 
-                    # Usar fetch NA PAGINA DO DRIVE (mesmo domínio, sem CORS)
-                    file_content = await download_page.evaluate(f"""
-                        async () => {{
-                            try {{
-                                const resp = await fetch('{download_url}', {{ credentials: 'include' }});
-                                if (!resp.ok) return {{ error: 'HTTP ' + resp.status }};
-                                const blob = await resp.blob();
-                                return new Promise((resolve) => {{
-                                    const reader = new FileReader();
-                                    reader.onload = () => resolve({{ 
-                                        data: reader.result.split(',')[1],
-                                        size: blob.size,
-                                        type: blob.type
-                                    }});
-                                    reader.readAsDataURL(blob);
-                                }});
-                            }} catch(e) {{
-                                return {{ error: e.message }};
-                            }}
-                        }}
-                    """)
+                    elif tipo == 'google_slides':
+                        # Google Slides -> exportar como PDF
+                        export_url = f"https://docs.google.com/presentation/d/{file_id}/export?format=pdf"
+                        file_content = await _download_via_export(context, export_url, logger)
+                        if not file_content or file_content.get("error"):
+                            file_content = await _download_via_button(context, f"https://docs.google.com/presentation/d/{file_id}/view", logger)
 
-                    await download_page.close()
+                    elif tipo == 'google_sheets':
+                        # Google Sheets -> exportar como Excel
+                        export_url = f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=xlsx"
+                        file_content = await _download_via_export(context, export_url, logger)
+                        if not file_content or file_content.get("error"):
+                            file_content = await _download_via_button(context, f"https://docs.google.com/spreadsheets/d/{file_id}/view", logger)
 
-                    if file_content and not file_content.get("error"):
-                        file_size = file_content.get("size", 0)
-                        # Verificar se o download retornou HTML (página de confirmação) em vez do arquivo
-                        if file_size < 500 and file_content.get("type", "").startswith("text/html"):
-                            # Tentar com confirm=t (para arquivos grandes que pedem confirmação)
-                            confirm_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
-                            download_page2 = await context.new_page()
-                            await download_page2.goto(confirm_url, wait_until="domcontentloaded", timeout=30000)
-                            await download_page2.wait_for_timeout(2000)
-                            file_content = await download_page2.evaluate(f"""
-                                async () => {{
-                                    try {{
-                                        const resp = await fetch('{confirm_url}', {{ credentials: 'include' }});
-                                        if (!resp.ok) return {{ error: 'HTTP ' + resp.status }};
-                                        const blob = await resp.blob();
-                                        return new Promise((resolve) => {{
-                                            const reader = new FileReader();
-                                            reader.onload = () => resolve({{ 
-                                                data: reader.result.split(',')[1],
-                                                size: blob.size,
-                                                type: blob.type
-                                            }});
-                                            reader.readAsDataURL(blob);
-                                        }});
-                                    }} catch(e) {{
-                                        return {{ error: e.message }};
-                                    }}
-                                }}
-                            """)
-                            await download_page2.close()
-                            file_size = file_content.get("size", 0) if file_content else 0
+                    else:
+                        # drive_file: PDF, Excel, PPT, Word, imagem etc
+                        # Abrir no viewer do Drive e clicar no botão de download
+                        view_url = f"https://drive.google.com/file/d/{file_id}/view"
+                        file_content = await _download_via_button(context, view_url, logger)
+                        if not file_content or file_content.get("error"):
+                            # Fallback: tentar export URL direto
+                            export_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
+                            file_content = await _download_via_export(context, export_url, logger)
 
                     if file_content and not file_content.get("error") and file_content.get("size", 0) > 0:
                         dados["arquivos_novos"].append({
                             "nome": anexo_nome,
                             "file_id": file_id,
+                            "tipo_arquivo": tipo,
                             "tamanho": file_content.get("size", 0),
-                            "tipo": file_content.get("type", ""),
+                            "mime_type": file_content.get("type", ""),
                             "conteudo_base64": file_content.get("data", ""),
                             "turma": req.turma_nome
                         })
