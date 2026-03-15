@@ -124,9 +124,9 @@ app = FastAPI(
     version="3.5.0"
 )
 
-# Classroom V2 — endpoints fragmentados (turmas + turma individual)
-from classroom_v2 import router as classroom_v2_router
-app.include_router(classroom_v2_router)
+# Classroom V3 — endpoints fragmentados com download por tipo de arquivo
+from classroom_v3 import router as classroom_v3_router
+app.include_router(classroom_v3_router)
 
 
 def verificar_auth(authorization: str = Header(None)):
