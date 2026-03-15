@@ -124,6 +124,10 @@ app = FastAPI(
     version="3.5.0"
 )
 
+# Classroom V2 — endpoints fragmentados (turmas + turma individual)
+from classroom_v2 import router as classroom_v2_router
+app.include_router(classroom_v2_router)
+
 
 def verificar_auth(authorization: str = Header(None)):
     if not API_SECRET:
