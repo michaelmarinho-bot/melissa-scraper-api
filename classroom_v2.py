@@ -454,8 +454,13 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
                 try:
                     download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
 
-                    # Usar JavaScript fetch no contexto autenticado do browser
-                    file_content = await page.evaluate(f"""
+                    # Abrir nova aba no mesmo contexto autenticado
+                    download_page = await context.new_page()
+                    await download_page.goto(download_url, wait_until="domcontentloaded", timeout=30000)
+                    await download_page.wait_for_timeout(2000)
+
+                    # Usar fetch NA PAGINA DO DRIVE (mesmo domínio, sem CORS)
+                    file_content = await download_page.evaluate(f"""
                         async () => {{
                             try {{
                                 const resp = await fetch('{download_url}', {{ credentials: 'include' }});
@@ -476,7 +481,41 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
                         }}
                     """)
 
+                    await download_page.close()
+
                     if file_content and not file_content.get("error"):
+                        file_size = file_content.get("size", 0)
+                        # Verificar se o download retornou HTML (página de confirmação) em vez do arquivo
+                        if file_size < 500 and file_content.get("type", "").startswith("text/html"):
+                            # Tentar com confirm=t (para arquivos grandes que pedem confirmação)
+                            confirm_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
+                            download_page2 = await context.new_page()
+                            await download_page2.goto(confirm_url, wait_until="domcontentloaded", timeout=30000)
+                            await download_page2.wait_for_timeout(2000)
+                            file_content = await download_page2.evaluate(f"""
+                                async () => {{
+                                    try {{
+                                        const resp = await fetch('{confirm_url}', {{ credentials: 'include' }});
+                                        if (!resp.ok) return {{ error: 'HTTP ' + resp.status }};
+                                        const blob = await resp.blob();
+                                        return new Promise((resolve) => {{
+                                            const reader = new FileReader();
+                                            reader.onload = () => resolve({{ 
+                                                data: reader.result.split(',')[1],
+                                                size: blob.size,
+                                                type: blob.type
+                                            }});
+                                            reader.readAsDataURL(blob);
+                                        }});
+                                    }} catch(e) {{
+                                        return {{ error: e.message }};
+                                    }}
+                                }}
+                            """)
+                            await download_page2.close()
+                            file_size = file_content.get("size", 0) if file_content else 0
+
+                    if file_content and not file_content.get("error") and file_content.get("size", 0) > 0:
                         dados["arquivos_novos"].append({
                             "nome": anexo_nome,
                             "file_id": file_id,
