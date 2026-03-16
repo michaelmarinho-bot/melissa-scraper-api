@@ -121,7 +121,7 @@ class ScrapeResponse(BaseModel):
 app = FastAPI(
     title="Melissa Scraper API",
     description="API de scraping com Playwright para a Agente Melissa",
-    version="3.6.1"
+    version="3.6.2"
 )
 
 # Classroom V3 — endpoints fragmentados com download por tipo de arquivo
@@ -1285,7 +1285,7 @@ def health():
     return {
         "status": "ok",
         "service": "melissa-scraper-playwright",
-        "version": "3.6.1",
+        "version": "3.6.2",
         "timestamp": datetime.now().isoformat(),
         "playwright": True,
         "async_jobs": True
@@ -1295,8 +1295,8 @@ def health():
 @app.get("/")
 def root():
     return {
-        "service": "Melissa Scraper API v3.6.1 (Fix: navegação turma + reutilizar aba download)",
-        "version": "3.6.1",
+        "service": "Melissa Scraper API v3.6.2 (Fix: SuperApp/Conteúdo sempre async + reutilizar aba download)",
+        "version": "3.6.2",
         "docs": "/docs",
         "health": "/health",
         "endpoints": [
@@ -1357,38 +1357,20 @@ async def endpoint_classroom(req: ScrapeRequest, background_tasks: BackgroundTas
 @app.post("/scrape/superapp")
 async def endpoint_superapp(req: ScrapeRequest, background_tasks: BackgroundTasks, authorization: str = Header(None), async_mode: bool = False):
     verificar_auth(authorization)
-    if async_mode or req.dict().get("async", False):
-        job_id = create_job("superapp")
-        background_tasks.add_task(run_scrape_job, job_id, "superapp", scrape_superapp_async, req)
-        return {"job_id": job_id, "status": "processing", "poll_url": f"/job/{job_id}"}
-    logger.info(f"Scraping SuperApp para {req.aluna}")
-    dados = await scrape_superapp_async(req)
-    return ScrapeResponse(
-        status="success" if not dados.get("erros") else "partial",
-        fonte="superapp",
-        data_coleta=datetime.now().isoformat(),
-        dados=dados,
-        erros=dados.get("erros", [])
-    )
+    # SuperApp SEMPRE usa modo assíncrono (demora mais que 30s no Render)
+    job_id = create_job("superapp")
+    background_tasks.add_task(run_scrape_job, job_id, "superapp", scrape_superapp_async, req)
+    return {"job_id": job_id, "status": "processing", "poll_url": f"/job/{job_id}"}
 
 
-# --- SuperApp Conte\u00fado ---
+# # --- SuperApp Conteúdo ---
 @app.post("/scrape/superapp/conteudo")
 async def endpoint_superapp_conteudo(req: ConteudoRequest, background_tasks: BackgroundTasks, authorization: str = Header(None), async_mode: bool = False):
     verificar_auth(authorization)
-    if async_mode or req.dict().get("async", False):
-        job_id = create_job("superapp-conteudo")
-        background_tasks.add_task(run_scrape_job, job_id, "superapp-conteudo", scrape_superapp_conteudo_async, req)
-        return {"job_id": job_id, "status": "processing", "poll_url": f"/job/{job_id}"}
-    logger.info(f"Scraping Conte\u00fado de Aula - Mat\u00e9ria: {req.materia or 'LISTA'}")
-    dados = await scrape_superapp_conteudo_async(req)
-    return {
-        "status": "success" if not dados.get("erros") else "partial",
-        "fonte": "superapp-conteudo",
-        "data_coleta": datetime.now().isoformat(),
-        "dados": dados,
-        "erros": dados.get("erros", [])
-    }
+    # SuperApp Conteúdo SEMPRE usa modo assíncrono (demora mais que 30s no Render)
+    job_id = create_job("superapp-conteudo")
+    background_tasks.add_task(run_scrape_job, job_id, "superapp-conteudo", scrape_superapp_conteudo_async, req)
+    return {"job_id": job_id, "status": "processing", "poll_url": f"/job/{job_id}"}
 
 
 # --- Roteiro ---
