@@ -664,44 +664,25 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
                 dados["erros"].append("Falha no login Google")
                 return dados
 
-            # 2. Primeiro ir ao Classroom para garantir sessão
-            logger.info("[ClassroomV3] Navegando para Classroom principal...")
-            await page.goto("https://classroom.google.com/", wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(3000)
-            logger.info(f"[ClassroomV3] URL após ir ao Classroom: {page.url}")
-
-            # 3. Navegar para a aba Atividades da turma
+            # 2. Navegar para a aba Atividades da turma
             course_id_match = re.search(r'/c/(\w+)', req.turma_link)
             if course_id_match:
-                course_id = course_id_match.group(1)
-                atividades_url = f"https://classroom.google.com/w/{course_id}/t/all"
+                atividades_url = f"https://classroom.google.com/w/{course_id_match.group(1)}/t/all"
             else:
                 atividades_url = req.turma_link
 
             logger.info(f"[ClassroomV3] Acessando turma: {req.turma_nome} -> {atividades_url}")
             await page.goto(atividades_url, wait_until="domcontentloaded", timeout=30000)
             await page.wait_for_timeout(5000)
-            logger.info(f"[ClassroomV3] URL final após navegar para turma: {page.url}")
-
-            # Se redirecionou para a página principal, tentar URL alternativa
-            if "/w/" not in page.url and "/c/" not in page.url:
-                logger.warning(f"[ClassroomV3] Redirecionou! Tentando URL direta da turma...")
-                await page.goto(req.turma_link, wait_until="domcontentloaded", timeout=30000)
-                await page.wait_for_timeout(5000)
-                logger.info(f"[ClassroomV3] URL após turma_link direto: {page.url}")
-                
-                # Agora tentar clicar na aba "Atividades"
-                atividades_tab = page.locator('a[href*="/w/"], [aria-label*="Atividades"], :text("Atividades")')
-                if await atividades_tab.count() > 0:
-                    await atividades_tab.first.click()
-                    await page.wait_for_timeout(3000)
-                    logger.info(f"[ClassroomV3] URL após clicar Atividades: {page.url}")
+            logger.info(f"[ClassroomV3] URL após navegar para turma: {page.url}")
 
             if "classroom.google.com" not in page.url:
                 dados["erros"].append(f"Não acessou a turma. URL: {page.url}")
                 return dados
 
-            logger.info(f"[ClassroomV3] Dentro da turma! URL: {page.url}")
+            # Log do título da página para diagnóstico
+            page_title = await page.title()
+            logger.info(f"[ClassroomV3] Título da página: {page_title}")
 
             # 3. Rolar para carregar todos os materiais
             for _ in range(5):
