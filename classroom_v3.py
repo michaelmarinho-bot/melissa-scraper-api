@@ -5,7 +5,7 @@ Versão: 3.8.0 — Arquivos temporários + endpoint de download (sem base64 no J
 Endpoints:
   POST /scrape/classroom/turmas  - Lista todas as turmas do Classroom
   POST /scrape/classroom/turma   - Coleta materiais e arquivos de 1 turma (com download)
-  GET  /scrape/classroom/files/{file_key}  - Download de arquivo temporário (NOVO v3.8.1)
+  GET  /scrape/classroom/files/{file_key}  - Download de arquivo temporário (NOVO v3.8.2)
 
 Tipos de download suportados:
   - Google Docs   → .pdf (export URL direto) [v3.7.0: era .docx]
@@ -19,7 +19,7 @@ Arquitetura:
   - Cada chamada abre e fecha o browser (1 turma = 1 browser = pouca memória)
   - UMA ÚNICA aba de download é reutilizada para todos os arquivos (fix v3.6.0)
   - O n8n faz o inventário no Drive e orquestra as chamadas
-  - v3.8.1: Arquivos ficam em /tmp/ no servidor. O JSON retorna apenas metadados
+  - v3.8.2: Arquivos ficam em /tmp/ no servidor. O JSON retorna apenas metadados
     (nome, tamanho, file_key). O n8n baixa 1 a 1 via GET /files/{file_key}
     e faz upload no Drive. Isso evita crash de memória no n8n.
   - Export PDF é mais leve e estável que DOCX/PPTX/XLSX (v3.7.0)
@@ -27,6 +27,8 @@ Arquitetura:
   - Fix: ERR_ABORTED tratado corretamente no export URL (v3.7.1)
 
 Changelog:
+  v3.8.2 — Download em batches de 2 arquivos com reopen do browser entre batches
+            Evita crash de memória no Render 512MB com muitos arquivos
   v3.8.1 — Arquivos temporários + endpoint GET /files/{file_key}
             Sem base64 no JSON de resultado → n8n não estoura memória
   v3.7.1 — Fix ERR_ABORTED no export PDF
@@ -63,7 +65,7 @@ router = APIRouter(prefix="/scrape/classroom", tags=["Classroom V3"])
 # Jobs store
 classroom_jobs: Dict[str, Dict[str, Any]] = {}
 
-# v3.8.1: Store de arquivos temporários
+# v3.8.2: Store de arquivos temporários
 # Formato: { file_key: { "path": "/tmp/...", "filename": "nome.pdf", "size": 12345, "created_at": "..." } }
 temp_files: Dict[str, Dict[str, Any]] = {}
 
@@ -117,7 +119,7 @@ def create_classroom_job(fonte: str) -> str:
 
 def register_temp_file(file_path: str, filename: str, size: int) -> str:
     """
-    v3.8.1: Registra um arquivo temporário e retorna uma file_key única.
+    v3.8.2: Registra um arquivo temporário e retorna uma file_key única.
     O n8n usa essa key para baixar o arquivo via GET /files/{file_key}.
     """
     file_key = uuid.uuid4().hex[:12]
@@ -231,14 +233,14 @@ async def criar_browser(p):
 
 # ============================================================
 # DOWNLOAD HELPERS — Por tipo de arquivo
-# v3.8.1: Agora salvam em /tmp/ e retornam file_key (sem base64)
+# v3.8.2: Agora salvam em /tmp/ e retornam file_key (sem base64)
 # ============================================================
 
 async def download_drive_file(page, file_id: str, nome: str) -> dict:
     """
     Download de arquivo do Drive (PDF, imagem, Office, etc.)
     REUTILIZA a page existente — navega, baixa, e limpa.
-    v3.8.1: Salva em /tmp/ e retorna file_key.
+    v3.8.2: Salva em /tmp/ e retorna file_key.
     """
     try:
         view_url = f"https://drive.google.com/file/d/{file_id}/view"
@@ -326,7 +328,7 @@ async def download_drive_file(page, file_id: str, nome: str) -> dict:
 async def download_google_doc(page, file_id: str, nome: str) -> dict:
     """
     Download de Google Docs como .pdf via export URL direto.
-    v3.8.1: Salva em /tmp/ e retorna file_key (sem base64).
+    v3.8.2: Salva em /tmp/ e retorna file_key (sem base64).
     """
     try:
         export_url = f"https://docs.google.com/document/d/{file_id}/export?format=pdf"
@@ -369,7 +371,7 @@ async def download_google_doc(page, file_id: str, nome: str) -> dict:
 async def download_google_slides(page, file_id: str, nome: str) -> dict:
     """
     Download de Google Slides como .pdf via export URL direto.
-    v3.8.1: Salva em /tmp/ e retorna file_key (sem base64).
+    v3.8.2: Salva em /tmp/ e retorna file_key (sem base64).
     """
     try:
         export_url = f"https://docs.google.com/presentation/d/{file_id}/export?format=pdf"
@@ -412,7 +414,7 @@ async def download_google_slides(page, file_id: str, nome: str) -> dict:
 async def download_google_sheets(page, file_id: str, nome: str) -> dict:
     """
     Download de Google Sheets como .pdf via export URL direto.
-    v3.8.1: Salva em /tmp/ e retorna file_key (sem base64).
+    v3.8.2: Salva em /tmp/ e retorna file_key (sem base64).
     """
     try:
         export_url = f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=pdf"
@@ -456,7 +458,7 @@ async def download_arquivo(page, anexo: dict) -> dict:
     """
     Router de download — escolhe a estratégia correta por tipo de arquivo.
     REUTILIZA a mesma page para todos os downloads.
-    v3.8.1: Retorna dict com file_key, size, filename ou error.
+    v3.8.2: Retorna dict com file_key, size, filename ou error.
     """
     file_id = anexo.get("fileId", "")
     nome = anexo.get("nome", "arquivo")
@@ -555,10 +557,13 @@ async def scrape_listar_turmas(req: TurmasRequest) -> dict:
 async def scrape_coletar_turma(req: TurmaRequest) -> dict:
     """
     Coleta materiais, textos e arquivos de 1 turma do Classroom.
-    v3.8.1: Arquivos ficam em /tmp/, retorna file_key para download posterior.
-    O n8n baixa 1 a 1 via GET /files/{file_key} e faz upload no Drive.
+    v3.8.2: Download em batches de 2 arquivos. Fecha e reabre o browser
+    entre batches para liberar memória (Render 512MB).
+    Arquivos ficam em /tmp/, retorna file_key para download posterior.
     """
     from playwright.async_api import async_playwright
+
+    BATCH_SIZE = 2  # v3.8.2: baixar 2 arquivos por vez
 
     email = req.email or MELISSA_EMAIL
     password = req.password or MELISSA_PASSWORD
@@ -569,11 +574,16 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
         "turma_link": req.turma_link,
         "materiais": [],
         "textos": [],
-        "arquivos_novos": [],       # v3.8.1: agora contém file_key em vez de base64
+        "arquivos_novos": [],
         "arquivos_existentes": [],
         "erros": [],
         "resumo": {}
     }
+
+    # =============================================
+    # FASE 1: Navegar, coletar materiais e anexos
+    # =============================================
+    arquivos_para_baixar = []
 
     async with async_playwright() as p:
         browser, context, page = await criar_browser(p)
@@ -603,7 +613,6 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
                         const nome = titleEl ? titleEl.textContent.trim() : '';
                         if (nome) {
                             materiais.push({ nome });
-                            // Tentar expandir
                             const expandBtn = item.querySelector('[aria-expanded="false"]');
                             if (expandBtn) expandBtn.click();
                         }
@@ -629,7 +638,6 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
                             textos.push(text.substring(0, 2000));
                         }
                     });
-                    // Também capturar descrições de atividades
                     const descDivs = document.querySelectorAll('.cBGSjd .dDKhVc, .ixkGjd .dDKhVc');
                     descDivs.forEach(div => {
                         const text = div.textContent?.trim();
@@ -647,7 +655,6 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
                 () => {
                     const anexos = [];
                     
-                    // Método 1: Links diretos para Google Docs/Slides/Sheets
                     const links = document.querySelectorAll('a[href*="docs.google.com"], a[href*="drive.google.com"], a[href*="slides.google.com"]');
                     links.forEach(link => {
                         const url = link.href;
@@ -666,7 +673,6 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
                         }
                     });
                     
-                    // Método 2: Elementos de anexo do Classroom
                     const attachments = document.querySelectorAll('.vwNuXe, .QRiHXd, [data-material-id]');
                     attachments.forEach(att => {
                         const link = att.querySelector('a[href]');
@@ -699,89 +705,108 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
             for a in anexos_todos:
                 logger.info(f"[ClassroomV3]   Anexo: {a['nome']} | tipo={a['tipo']} | id={a['fileId']}")
 
-            # Salvar materiais com seus metadados
+            # Salvar materiais
             for mat in materiais_info:
                 dados["materiais"].append({
                     "nome": mat.get("nome", ""),
                     "anexos_count": len(anexos_todos)
                 })
 
-            # 8. Para cada anexo: verificar inventário → baixar se novo
-            download_page = None
-            arquivos_para_baixar = []
-
+            # Filtrar: só baixar arquivos novos
             for anexo in anexos_todos:
                 anexo_nome = anexo.get("nome", "")
                 file_id = anexo.get("fileId", "")
-
                 if not file_id:
                     continue
-
-                # Verificar inventário
                 if anexo_nome in existentes:
                     logger.info(f"[ClassroomV3] Já existe no Drive: {anexo_nome}")
                     dados["arquivos_existentes"].append(anexo_nome)
                     continue
-
                 arquivos_para_baixar.append(anexo)
 
-            if arquivos_para_baixar:
-                logger.info(f"[ClassroomV3] {len(arquivos_para_baixar)} arquivos para baixar")
-                
-                # Criar UMA aba de download
-                download_page = await context.new_page()
-                logger.info("[ClassroomV3] Aba de download criada (será reutilizada para todos os arquivos)")
-
-                for i, anexo in enumerate(arquivos_para_baixar):
-                    anexo_nome = anexo.get("nome", "")
-                    file_id = anexo.get("fileId", "")
-
-                    logger.info(f"[ClassroomV3] Baixando [{i+1}/{len(arquivos_para_baixar)}]: {anexo_nome}")
-                    try:
-                        # Reutilizar a MESMA aba para cada download
-                        result = await download_arquivo(download_page, anexo)
-
-                        if result and not result.get("error") and result.get("size", 0) > 0:
-                            # v3.8.1: Retorna file_key em vez de base64
-                            dados["arquivos_novos"].append({
-                                "nome": anexo_nome,
-                                "file_id": file_id,
-                                "tipo": anexo.get("tipo", ""),
-                                "tamanho": result.get("size", 0),
-                                "filename": result.get("filename", anexo_nome),
-                                "file_key": result.get("file_key", ""),
-                                "turma": req.turma_nome
-                            })
-                            logger.info(f"[ClassroomV3] Download OK: {anexo_nome} | {result.get('size', 0)} bytes | {result.get('filename', '')} | key={result.get('file_key', '')}")
-                        else:
-                            error_msg = result.get("error", "Erro desconhecido") if result else "Sem resposta"
-                            dados["erros"].append(f"Download falhou: {anexo_nome} - {error_msg}")
-                            logger.error(f"[ClassroomV3] Falhou: {anexo_nome} - {error_msg}")
-
-                    except Exception as e:
-                        dados["erros"].append(f"Erro download: {anexo_nome} - {str(e)}")
-                        logger.error(f"[ClassroomV3] Erro: {anexo_nome} - {e}")
-
-                    # Forçar limpeza de memória após cada download
-                    gc.collect()
-                    logger.info(f"[ClassroomV3] gc.collect() após download {i+1}")
-
-                # Fechar a aba de download no final
-                if download_page:
-                    try:
-                        await download_page.close()
-                        logger.info("[ClassroomV3] Aba de download fechada")
-                    except:
-                        pass
-            else:
-                logger.info("[ClassroomV3] Nenhum arquivo novo para baixar")
-
         except Exception as e:
-            logger.error(f"[ClassroomV3] Erro geral turma: {e}\n{traceback.format_exc()}")
+            logger.error(f"[ClassroomV3] Erro geral turma (fase 1): {e}\n{traceback.format_exc()}")
             dados["erros"].append(f"Erro geral: {str(e)}")
         finally:
             await browser.close()
             gc.collect()
+            logger.info("[ClassroomV3] Browser FASE 1 fechado e memória liberada")
+
+    # =============================================
+    # FASE 2: Download em batches de BATCH_SIZE
+    # Abre e fecha o browser a cada batch
+    # =============================================
+    if not arquivos_para_baixar:
+        logger.info("[ClassroomV3] Nenhum arquivo novo para baixar")
+    else:
+        total = len(arquivos_para_baixar)
+        logger.info(f"[ClassroomV3] {total} arquivos para baixar em batches de {BATCH_SIZE}")
+
+        for batch_start in range(0, total, BATCH_SIZE):
+            batch = arquivos_para_baixar[batch_start:batch_start + BATCH_SIZE]
+            batch_num = (batch_start // BATCH_SIZE) + 1
+            total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
+            logger.info(f"[ClassroomV3] === BATCH {batch_num}/{total_batches} ({len(batch)} arquivos) ===")
+
+            async with async_playwright() as p:
+                browser, context, page = await criar_browser(p)
+                try:
+                    logged_in = await google_login(page, email, password)
+                    if not logged_in:
+                        dados["erros"].append(f"Falha no login (batch {batch_num})")
+                        continue
+
+                    # Criar aba de download para este batch
+                    download_page = await context.new_page()
+                    logger.info(f"[ClassroomV3] Aba de download criada para batch {batch_num}")
+
+                    for i, anexo in enumerate(batch):
+                        anexo_nome = anexo.get("nome", "")
+                        file_id = anexo.get("fileId", "")
+                        global_idx = batch_start + i + 1
+
+                        logger.info(f"[ClassroomV3] Baixando [{global_idx}/{total}]: {anexo_nome}")
+                        try:
+                            result = await download_arquivo(download_page, anexo)
+
+                            if result and not result.get("error") and result.get("size", 0) > 0:
+                                dados["arquivos_novos"].append({
+                                    "nome": anexo_nome,
+                                    "file_id": file_id,
+                                    "tipo": anexo.get("tipo", ""),
+                                    "tamanho": result.get("size", 0),
+                                    "filename": result.get("filename", anexo_nome),
+                                    "file_key": result.get("file_key", ""),
+                                    "turma": req.turma_nome
+                                })
+                                logger.info(f"[ClassroomV3] Download OK: {anexo_nome} | {result.get('size', 0)} bytes | key={result.get('file_key', '')}")
+                            else:
+                                error_msg = result.get("error", "Erro desconhecido") if result else "Sem resposta"
+                                dados["erros"].append(f"Download falhou: {anexo_nome} - {error_msg}")
+                                logger.error(f"[ClassroomV3] Falhou: {anexo_nome} - {error_msg}")
+
+                        except Exception as e:
+                            dados["erros"].append(f"Erro download: {anexo_nome} - {str(e)}")
+                            logger.error(f"[ClassroomV3] Erro: {anexo_nome} - {e}")
+
+                        gc.collect()
+
+                    # Fechar aba de download
+                    try:
+                        await download_page.close()
+                    except:
+                        pass
+
+                except Exception as e:
+                    logger.error(f"[ClassroomV3] Erro batch {batch_num}: {e}")
+                    dados["erros"].append(f"Erro batch {batch_num}: {str(e)}")
+                finally:
+                    await browser.close()
+                    gc.collect()
+                    logger.info(f"[ClassroomV3] Browser BATCH {batch_num} fechado e memória liberada")
+
+            # Pausa entre batches para garantir limpeza de memória
+            await asyncio.sleep(2)
 
     dados["resumo"] = {
         "turma": req.turma_nome,
@@ -854,7 +879,7 @@ def get_turmas_job(job_id: str, authorization: str = Header(None)):
 @router.get("/files/{file_key}")
 async def download_temp_file(file_key: str, authorization: str = Header(None)):
     """
-    v3.8.1: Endpoint para download de arquivo temporário.
+    v3.8.2: Endpoint para download de arquivo temporário.
     O n8n chama este endpoint para baixar 1 arquivo por vez e fazer upload no Drive.
     Após o download, o arquivo é marcado como baixado (mas não deletado imediatamente).
     """
@@ -882,7 +907,7 @@ async def download_temp_file(file_key: str, authorization: str = Header(None)):
 @router.delete("/files/{file_key}")
 async def delete_temp_file(file_key: str, authorization: str = Header(None)):
     """
-    v3.8.1: Endpoint para limpar arquivo temporário após upload no Drive.
+    v3.8.2: Endpoint para limpar arquivo temporário após upload no Drive.
     O n8n chama este endpoint após confirmar o upload.
     """
     verificar_auth(authorization)
@@ -920,7 +945,7 @@ async def endpoint_coletar_turma(
 ):
     """
     Coleta materiais, textos e arquivos de 1 turma.
-    v3.8.1: Retorna file_key para cada arquivo. O n8n baixa via GET /files/{file_key}.
+    v3.8.2: Retorna file_key para cada arquivo. O n8n baixa via GET /files/{file_key}.
     """
     verificar_auth(authorization)
     job_id = create_classroom_job(f"classroom-turma-{req.turma_nome[:20]}")
