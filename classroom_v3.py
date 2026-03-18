@@ -1,15 +1,15 @@
 """
 Classroom V3 — Endpoints fragmentados com download por tipo de arquivo
-Versão: 3.6.1 — Fix: reutilizar mesma aba para downloads (economia de memória)
+Versão: 3.7.0 — Export PDF para Google Docs/Slides/Sheets (economia de memória)
 
 Endpoints:
   POST /scrape/classroom/turmas  - Lista todas as turmas do Classroom
   POST /scrape/classroom/turma   - Coleta materiais e arquivos de 1 turma (com download)
 
 Tipos de download suportados:
-  - Google Docs   → .docx (export URL direto)
-  - Google Slides → .pptx (export URL direto)
-  - Google Sheets → .xlsx (export URL direto)
+  - Google Docs   → .pdf (export URL direto) [v3.7.0: era .docx]
+  - Google Slides → .pdf (export URL direto) [v3.7.0: era .pptx]
+  - Google Sheets → .pdf (export URL direto) [v3.7.0: era .xlsx]
   - PDF           → .pdf  (Drive viewer → botão Baixar)
   - Imagem        → .png/.jpg original (Drive viewer → botão Baixar)
   - Office files  → formato original (Drive viewer → botão Baixar)
@@ -19,7 +19,8 @@ Arquitetura:
   - UMA ÚNICA aba de download é reutilizada para todos os arquivos (fix v3.6.0)
   - O n8n faz o inventário no Drive e orquestra as chamadas
   - A API faz scraping + download, retorna arquivos em base64
-  - Nenhuma conversão de formato — tudo no formato original
+  - Export PDF é mais leve e estável que DOCX/PPTX/XLSX (v3.7.0)
+  - Fallback do editor removido — evita crash de memória no Render 512MB (v3.7.0)
 """
 
 import os
@@ -285,13 +286,15 @@ async def download_drive_file(page, file_id: str, nome: str) -> dict:
 
 async def download_google_doc(page, file_id: str, nome: str) -> dict:
     """
-    Download de Google Docs como .docx via export URL direto.
+    Download de Google Docs como .pdf via export URL direto.
     REUTILIZA a page existente.
+    v3.7.0: Mudou de .docx para .pdf (mais estável, menos memória).
+    v3.7.0: Removido fallback do editor (causava crash de memória no Render 512MB).
     """
     try:
-        # Export URL direto — mais confiável e usa menos memória
-        export_url = f"https://docs.google.com/document/d/{file_id}/export?format=docx"
-        logger.info(f"[ClassroomV3] download_google_doc: {nome} -> export docx")
+        # Export URL direto como PDF — mais estável e leve que DOCX
+        export_url = f"https://docs.google.com/document/d/{file_id}/export?format=pdf"
+        logger.info(f"[ClassroomV3] download_google_doc: {nome} -> export pdf")
 
         try:
             async with page.expect_download(timeout=30000) as download_info:
@@ -299,7 +302,7 @@ async def download_google_doc(page, file_id: str, nome: str) -> dict:
             download = await download_info.value
             tmp_path = f"/tmp/classroom_dl_{uuid.uuid4().hex[:8]}"
             await download.save_as(tmp_path)
-            suggested_name = download.suggested_filename or f"{nome}.docx"
+            suggested_name = download.suggested_filename or f"{nome}.pdf"
             with open(tmp_path, "rb") as f:
                 content = f.read()
             os.remove(tmp_path)
@@ -313,48 +316,13 @@ async def download_google_doc(page, file_id: str, nome: str) -> dict:
                 gc.collect()
                 return result
         except Exception as e:
-            logger.warning(f"[ClassroomV3] Export URL falhou para Google Doc: {e}")
+            logger.warning(f"[ClassroomV3] Export PDF falhou para Google Doc: {e}")
 
-        # Fallback: abrir editor e usar menu Arquivo → Baixar
-        doc_url = f"https://docs.google.com/document/d/{file_id}/edit"
-        await page.goto(doc_url, wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(5000)
-
-        try:
-            file_menu = page.locator('#docs-file-menu, [aria-label="Arquivo"]')
-            if await file_menu.count() > 0:
-                await file_menu.first.click()
-                await page.wait_for_timeout(1000)
-
-                download_menu = page.locator('[aria-label*="Baixar"], [aria-label*="Download"], :text("Baixar")')
-                if await download_menu.count() > 0:
-                    await download_menu.first.click()
-                    await page.wait_for_timeout(1000)
-
-                    async with page.expect_download(timeout=30000) as download_info:
-                        docx_option = page.locator(':text("Microsoft Word"), :text(".docx")')
-                        if await docx_option.count() > 0:
-                            await docx_option.first.click()
-
-                    download = await download_info.value
-                    tmp_path = f"/tmp/classroom_dl_{uuid.uuid4().hex[:8]}"
-                    await download.save_as(tmp_path)
-                    suggested_name = download.suggested_filename or f"{nome}.docx"
-                    with open(tmp_path, "rb") as f:
-                        content = f.read()
-                    os.remove(tmp_path)
-                    result = {
-                        "data": base64.b64encode(content).decode(),
-                        "size": len(content),
-                        "filename": suggested_name
-                    }
-                    del content
-                    gc.collect()
-                    return result
-        except Exception as e:
-            logger.error(f"[ClassroomV3] Menu download falhou para Google Doc: {e}")
-
-        return {"error": "Não conseguiu baixar Google Doc"}
+        # v3.7.0: Fallback do editor REMOVIDO — causava crash de memória
+        # O editor do Google Docs consome ~200-300MB RAM, inviável no Render 512MB.
+        # Se o export URL falhar, retorna erro e segue para o próximo arquivo.
+        logger.warning(f"[ClassroomV3] Google Doc não baixado (sem fallback): {nome}")
+        return {"error": f"Export PDF falhou para Google Doc: {nome}"}
 
     except Exception as e:
         logger.error(f"[ClassroomV3] download_google_doc erro: {e}")
@@ -363,13 +331,15 @@ async def download_google_doc(page, file_id: str, nome: str) -> dict:
 
 async def download_google_slides(page, file_id: str, nome: str) -> dict:
     """
-    Download de Google Slides como .pptx via export URL direto.
+    Download de Google Slides como .pdf via export URL direto.
     REUTILIZA a page existente.
+    v3.7.0: Mudou de .pptx para .pdf (mais estável, menos memória).
+    v3.7.0: Removido fallback do editor (causava crash de memória no Render 512MB).
     """
     try:
-        # Export URL direto
-        export_url = f"https://docs.google.com/presentation/d/{file_id}/export?format=pptx"
-        logger.info(f"[ClassroomV3] download_google_slides: {nome} -> export pptx")
+        # Export URL direto como PDF — mais estável e leve que PPTX
+        export_url = f"https://docs.google.com/presentation/d/{file_id}/export?format=pdf"
+        logger.info(f"[ClassroomV3] download_google_slides: {nome} -> export pdf")
 
         try:
             async with page.expect_download(timeout=30000) as download_info:
@@ -377,7 +347,7 @@ async def download_google_slides(page, file_id: str, nome: str) -> dict:
             download = await download_info.value
             tmp_path = f"/tmp/classroom_dl_{uuid.uuid4().hex[:8]}"
             await download.save_as(tmp_path)
-            suggested_name = download.suggested_filename or f"{nome}.pptx"
+            suggested_name = download.suggested_filename or f"{nome}.pdf"
             with open(tmp_path, "rb") as f:
                 content = f.read()
             os.remove(tmp_path)
@@ -391,48 +361,11 @@ async def download_google_slides(page, file_id: str, nome: str) -> dict:
                 gc.collect()
                 return result
         except Exception as e:
-            logger.warning(f"[ClassroomV3] Export URL falhou para Slides: {e}")
+            logger.warning(f"[ClassroomV3] Export PDF falhou para Slides: {e}")
 
-        # Fallback: abrir editor e usar menu
-        slides_url = f"https://docs.google.com/presentation/d/{file_id}/edit"
-        await page.goto(slides_url, wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(5000)
-
-        try:
-            file_menu = page.locator('#docs-file-menu, [aria-label="Arquivo"]')
-            if await file_menu.count() > 0:
-                await file_menu.first.click()
-                await page.wait_for_timeout(1000)
-
-                download_menu = page.locator('[aria-label*="Baixar"], [aria-label*="Download"], :text("Baixar")')
-                if await download_menu.count() > 0:
-                    await download_menu.first.click()
-                    await page.wait_for_timeout(1000)
-
-                    async with page.expect_download(timeout=30000) as download_info:
-                        pptx_option = page.locator(':text("Microsoft PowerPoint"), :text(".pptx")')
-                        if await pptx_option.count() > 0:
-                            await pptx_option.first.click()
-
-                    download = await download_info.value
-                    tmp_path = f"/tmp/classroom_dl_{uuid.uuid4().hex[:8]}"
-                    await download.save_as(tmp_path)
-                    suggested_name = download.suggested_filename or f"{nome}.pptx"
-                    with open(tmp_path, "rb") as f:
-                        content = f.read()
-                    os.remove(tmp_path)
-                    result = {
-                        "data": base64.b64encode(content).decode(),
-                        "size": len(content),
-                        "filename": suggested_name
-                    }
-                    del content
-                    gc.collect()
-                    return result
-        except Exception as e:
-            logger.error(f"[ClassroomV3] Menu download falhou para Slides: {e}")
-
-        return {"error": "Não conseguiu baixar Google Slides"}
+        # v3.7.0: Fallback do editor REMOVIDO — causava crash de memória
+        logger.warning(f"[ClassroomV3] Google Slides não baixado (sem fallback): {nome}")
+        return {"error": f"Export PDF falhou para Google Slides: {nome}"}
 
     except Exception as e:
         logger.error(f"[ClassroomV3] download_google_slides erro: {e}")
@@ -441,13 +374,15 @@ async def download_google_slides(page, file_id: str, nome: str) -> dict:
 
 async def download_google_sheets(page, file_id: str, nome: str) -> dict:
     """
-    Download de Google Sheets como .xlsx via export URL direto.
+    Download de Google Sheets como .pdf via export URL direto.
     REUTILIZA a page existente.
+    v3.7.0: Mudou de .xlsx para .pdf (mais estável, menos memória).
+    v3.7.0: Removido fallback do editor (causava crash de memória no Render 512MB).
     """
     try:
-        # Export URL direto
-        export_url = f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=xlsx"
-        logger.info(f"[ClassroomV3] download_google_sheets: {nome} -> export xlsx")
+        # Export URL direto como PDF — mais estável e leve que XLSX
+        export_url = f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=pdf"
+        logger.info(f"[ClassroomV3] download_google_sheets: {nome} -> export pdf")
 
         try:
             async with page.expect_download(timeout=30000) as download_info:
@@ -455,7 +390,7 @@ async def download_google_sheets(page, file_id: str, nome: str) -> dict:
             download = await download_info.value
             tmp_path = f"/tmp/classroom_dl_{uuid.uuid4().hex[:8]}"
             await download.save_as(tmp_path)
-            suggested_name = download.suggested_filename or f"{nome}.xlsx"
+            suggested_name = download.suggested_filename or f"{nome}.pdf"
             with open(tmp_path, "rb") as f:
                 content = f.read()
             os.remove(tmp_path)
@@ -469,48 +404,11 @@ async def download_google_sheets(page, file_id: str, nome: str) -> dict:
                 gc.collect()
                 return result
         except Exception as e:
-            logger.warning(f"[ClassroomV3] Export URL falhou para Sheets: {e}")
+            logger.warning(f"[ClassroomV3] Export PDF falhou para Sheets: {e}")
 
-        # Fallback: abrir editor e usar menu
-        sheets_url = f"https://docs.google.com/spreadsheets/d/{file_id}/edit"
-        await page.goto(sheets_url, wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(5000)
-
-        try:
-            file_menu = page.locator('#docs-file-menu, [aria-label="Arquivo"]')
-            if await file_menu.count() > 0:
-                await file_menu.first.click()
-                await page.wait_for_timeout(1000)
-
-                download_menu = page.locator('[aria-label*="Baixar"], [aria-label*="Download"], :text("Baixar")')
-                if await download_menu.count() > 0:
-                    await download_menu.first.click()
-                    await page.wait_for_timeout(1000)
-
-                    async with page.expect_download(timeout=30000) as download_info:
-                        xlsx_option = page.locator(':text("Microsoft Excel"), :text(".xlsx")')
-                        if await xlsx_option.count() > 0:
-                            await xlsx_option.first.click()
-
-                    download = await download_info.value
-                    tmp_path = f"/tmp/classroom_dl_{uuid.uuid4().hex[:8]}"
-                    await download.save_as(tmp_path)
-                    suggested_name = download.suggested_filename or f"{nome}.xlsx"
-                    with open(tmp_path, "rb") as f:
-                        content = f.read()
-                    os.remove(tmp_path)
-                    result = {
-                        "data": base64.b64encode(content).decode(),
-                        "size": len(content),
-                        "filename": suggested_name
-                    }
-                    del content
-                    gc.collect()
-                    return result
-        except Exception as e:
-            logger.error(f"[ClassroomV3] Menu download falhou para Sheets: {e}")
-
-        return {"error": "Não conseguiu baixar Google Sheets"}
+        # v3.7.0: Fallback do editor REMOVIDO — causava crash de memória
+        logger.warning(f"[ClassroomV3] Google Sheets não baixado (sem fallback): {nome}")
+        return {"error": f"Export PDF falhou para Google Sheets: {nome}"}
 
     except Exception as e:
         logger.error(f"[ClassroomV3] download_google_sheets erro: {e}")
@@ -633,6 +531,7 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
     
     v3.6.0: Reutiliza UMA ÚNICA aba de download para todos os arquivos.
     Isso reduz drasticamente o uso de memória (de N abas para 1 aba).
+    v3.7.0: Export PDF para Docs/Slides/Sheets + remoção de fallbacks pesados.
     """
     from playwright.async_api import async_playwright
 
