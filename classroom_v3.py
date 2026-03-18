@@ -5,7 +5,7 @@ Versão: 3.8.0 — Arquivos temporários + endpoint de download (sem base64 no J
 Endpoints:
   POST /scrape/classroom/turmas  - Lista todas as turmas do Classroom
   POST /scrape/classroom/turma   - Coleta materiais e arquivos de 1 turma (com download)
-  GET  /scrape/classroom/files/{file_key}  - Download de arquivo temporário (NOVO v3.8.0)
+  GET  /scrape/classroom/files/{file_key}  - Download de arquivo temporário (NOVO v3.8.1)
 
 Tipos de download suportados:
   - Google Docs   → .pdf (export URL direto) [v3.7.0: era .docx]
@@ -19,7 +19,7 @@ Arquitetura:
   - Cada chamada abre e fecha o browser (1 turma = 1 browser = pouca memória)
   - UMA ÚNICA aba de download é reutilizada para todos os arquivos (fix v3.6.0)
   - O n8n faz o inventário no Drive e orquestra as chamadas
-  - v3.8.0: Arquivos ficam em /tmp/ no servidor. O JSON retorna apenas metadados
+  - v3.8.1: Arquivos ficam em /tmp/ no servidor. O JSON retorna apenas metadados
     (nome, tamanho, file_key). O n8n baixa 1 a 1 via GET /files/{file_key}
     e faz upload no Drive. Isso evita crash de memória no n8n.
   - Export PDF é mais leve e estável que DOCX/PPTX/XLSX (v3.7.0)
@@ -27,7 +27,7 @@ Arquitetura:
   - Fix: ERR_ABORTED tratado corretamente no export URL (v3.7.1)
 
 Changelog:
-  v3.8.0 — Arquivos temporários + endpoint GET /files/{file_key}
+  v3.8.1 — Arquivos temporários + endpoint GET /files/{file_key}
             Sem base64 no JSON de resultado → n8n não estoura memória
   v3.7.1 — Fix ERR_ABORTED no export PDF
   v3.7.0 — Export PDF para Docs/Slides/Sheets + remover fallbacks pesados
@@ -63,7 +63,7 @@ router = APIRouter(prefix="/scrape/classroom", tags=["Classroom V3"])
 # Jobs store
 classroom_jobs: Dict[str, Dict[str, Any]] = {}
 
-# v3.8.0: Store de arquivos temporários
+# v3.8.1: Store de arquivos temporários
 # Formato: { file_key: { "path": "/tmp/...", "filename": "nome.pdf", "size": 12345, "created_at": "..." } }
 temp_files: Dict[str, Dict[str, Any]] = {}
 
@@ -117,7 +117,7 @@ def create_classroom_job(fonte: str) -> str:
 
 def register_temp_file(file_path: str, filename: str, size: int) -> str:
     """
-    v3.8.0: Registra um arquivo temporário e retorna uma file_key única.
+    v3.8.1: Registra um arquivo temporário e retorna uma file_key única.
     O n8n usa essa key para baixar o arquivo via GET /files/{file_key}.
     """
     file_key = uuid.uuid4().hex[:12]
@@ -231,14 +231,14 @@ async def criar_browser(p):
 
 # ============================================================
 # DOWNLOAD HELPERS — Por tipo de arquivo
-# v3.8.0: Agora salvam em /tmp/ e retornam file_key (sem base64)
+# v3.8.1: Agora salvam em /tmp/ e retornam file_key (sem base64)
 # ============================================================
 
 async def download_drive_file(page, file_id: str, nome: str) -> dict:
     """
     Download de arquivo do Drive (PDF, imagem, Office, etc.)
     REUTILIZA a page existente — navega, baixa, e limpa.
-    v3.8.0: Salva em /tmp/ e retorna file_key.
+    v3.8.1: Salva em /tmp/ e retorna file_key.
     """
     try:
         view_url = f"https://drive.google.com/file/d/{file_id}/view"
@@ -326,7 +326,7 @@ async def download_drive_file(page, file_id: str, nome: str) -> dict:
 async def download_google_doc(page, file_id: str, nome: str) -> dict:
     """
     Download de Google Docs como .pdf via export URL direto.
-    v3.8.0: Salva em /tmp/ e retorna file_key (sem base64).
+    v3.8.1: Salva em /tmp/ e retorna file_key (sem base64).
     """
     try:
         export_url = f"https://docs.google.com/document/d/{file_id}/export?format=pdf"
@@ -369,7 +369,7 @@ async def download_google_doc(page, file_id: str, nome: str) -> dict:
 async def download_google_slides(page, file_id: str, nome: str) -> dict:
     """
     Download de Google Slides como .pdf via export URL direto.
-    v3.8.0: Salva em /tmp/ e retorna file_key (sem base64).
+    v3.8.1: Salva em /tmp/ e retorna file_key (sem base64).
     """
     try:
         export_url = f"https://docs.google.com/presentation/d/{file_id}/export?format=pdf"
@@ -412,7 +412,7 @@ async def download_google_slides(page, file_id: str, nome: str) -> dict:
 async def download_google_sheets(page, file_id: str, nome: str) -> dict:
     """
     Download de Google Sheets como .pdf via export URL direto.
-    v3.8.0: Salva em /tmp/ e retorna file_key (sem base64).
+    v3.8.1: Salva em /tmp/ e retorna file_key (sem base64).
     """
     try:
         export_url = f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=pdf"
@@ -456,7 +456,7 @@ async def download_arquivo(page, anexo: dict) -> dict:
     """
     Router de download — escolhe a estratégia correta por tipo de arquivo.
     REUTILIZA a mesma page para todos os downloads.
-    v3.8.0: Retorna dict com file_key, size, filename ou error.
+    v3.8.1: Retorna dict com file_key, size, filename ou error.
     """
     file_id = anexo.get("fileId", "")
     nome = anexo.get("nome", "arquivo")
@@ -479,61 +479,83 @@ async def download_arquivo(page, anexo: dict) -> dict:
 # ============================================================
 
 async def scrape_listar_turmas(req: TurmasRequest) -> dict:
-    """Lista todas as turmas do Google Classroom."""
+    """Lista todas as turmas do Classroom."""
     from playwright.async_api import async_playwright
-
+    dados = {"turmas": [], "erros": []}
     email = req.email or MELISSA_EMAIL
     password = req.password or MELISSA_PASSWORD
-    dados = {"turmas": [], "erros": []}
-
     async with async_playwright() as p:
         browser, context, page = await criar_browser(p)
+
         try:
-            logged_in = await google_login(page, email, password)
-            if not logged_in:
-                dados["erros"].append("Falha no login do Google")
+            login_ok = await google_login(page, email, password)
+            if not login_ok:
+                dados["erros"].append("Falha no login Google")
                 return dados
 
-            await page.goto("https://classroom.google.com", wait_until="domcontentloaded", timeout=30000)
+            logger.info("[ClassroomV3] Navegando para Classroom...")
+            await page.goto("https://classroom.google.com/", wait_until="domcontentloaded", timeout=30000)
             await page.wait_for_timeout(5000)
 
-            turmas = await page.evaluate("""
+            if "classroom.google.com" not in page.url:
+                dados["erros"].append(f"Não acessou Classroom. URL: {page.url}")
+                return dados
+
+            for _ in range(3):
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await page.wait_for_timeout(1000)
+
+            turmas_raw = await page.evaluate("""
                 () => {
-                    const cards = document.querySelectorAll('[data-course-id]');
-                    const result = [];
+                    const turmas = [];
+                    const cards = document.querySelectorAll('[data-course-id], .gHz6xd, .YVvGBb');
                     cards.forEach(card => {
-                        const link = card.querySelector('a[href*="/c/"]');
-                        const nameEl = card.querySelector('.YVvGBb, .z3vRcc');
-                        const sectionEl = card.querySelector('.bq3UNd, .asQXV');
-                        if (link) {
-                            result.push({
-                                nome: (nameEl ? nameEl.textContent.trim() : '') + (sectionEl ? sectionEl.textContent.trim() : ''),
-                                link: link.href.replace('/c/', '/w/') + '/t/all'
-                            });
+                        const nome = card.querySelector('.YVvGBb, .R4EiSb, h2')?.textContent?.trim() || '';
+                        const secao = card.querySelector('.tL9Q4c, .Mdb1Xb')?.textContent?.trim() || '';
+                        const link = card.querySelector('a[href*="/c/"]')?.href || '';
+                        const courseId = card.getAttribute('data-course-id') || '';
+                        if (nome) {
+                            turmas.push({ nome, secao, link, courseId });
                         }
                     });
-                    return result;
+                    if (turmas.length === 0) {
+                        document.querySelectorAll('a[href*="/c/"]').forEach(a => {
+                            const nome = a.textContent?.trim() || '';
+                            if (nome && nome.length > 2) {
+                                turmas.push({ nome, secao: '', link: a.href, courseId: '' });
+                            }
+                        });
+                    }
+                    return turmas;
                 }
             """)
 
-            for t in turmas:
-                logger.info(f"[ClassroomV3] Turma: {t['nome']}")
-                dados["turmas"].append(t)
+            for turma in turmas_raw:
+                dados["turmas"].append(turma)
+                logger.info(f"[ClassroomV3] Turma: {turma['nome']}")
+
+            if not dados["turmas"]:
+                page_text = await page.evaluate("document.body.innerText")
+                dados["erros"].append(f"Nenhuma turma encontrada. Texto: {page_text[:1000]}")
 
         except Exception as e:
             logger.error(f"[ClassroomV3] Erro listar turmas: {e}\n{traceback.format_exc()}")
-            dados["erros"].append(str(e))
+            dados["erros"].append(f"Erro: {str(e)}")
         finally:
             await browser.close()
             gc.collect()
 
+    dados["resumo"] = {
+        "total_turmas": len(dados["turmas"]),
+        "total_erros": len(dados["erros"])
+    }
     return dados
 
 
 async def scrape_coletar_turma(req: TurmaRequest) -> dict:
     """
     Coleta materiais, textos e arquivos de 1 turma do Classroom.
-    v3.8.0: Arquivos ficam em /tmp/, retorna file_key para download posterior.
+    v3.8.1: Arquivos ficam em /tmp/, retorna file_key para download posterior.
     O n8n baixa 1 a 1 via GET /files/{file_key} e faz upload no Drive.
     """
     from playwright.async_api import async_playwright
@@ -547,7 +569,7 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
         "turma_link": req.turma_link,
         "materiais": [],
         "textos": [],
-        "arquivos_novos": [],       # v3.8.0: agora contém file_key em vez de base64
+        "arquivos_novos": [],       # v3.8.1: agora contém file_key em vez de base64
         "arquivos_existentes": [],
         "erros": [],
         "resumo": {}
@@ -720,7 +742,7 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
                         result = await download_arquivo(download_page, anexo)
 
                         if result and not result.get("error") and result.get("size", 0) > 0:
-                            # v3.8.0: Retorna file_key em vez de base64
+                            # v3.8.1: Retorna file_key em vez de base64
                             dados["arquivos_novos"].append({
                                 "nome": anexo_nome,
                                 "file_id": file_id,
@@ -832,7 +854,7 @@ def get_turmas_job(job_id: str, authorization: str = Header(None)):
 @router.get("/files/{file_key}")
 async def download_temp_file(file_key: str, authorization: str = Header(None)):
     """
-    v3.8.0: Endpoint para download de arquivo temporário.
+    v3.8.1: Endpoint para download de arquivo temporário.
     O n8n chama este endpoint para baixar 1 arquivo por vez e fazer upload no Drive.
     Após o download, o arquivo é marcado como baixado (mas não deletado imediatamente).
     """
@@ -860,7 +882,7 @@ async def download_temp_file(file_key: str, authorization: str = Header(None)):
 @router.delete("/files/{file_key}")
 async def delete_temp_file(file_key: str, authorization: str = Header(None)):
     """
-    v3.8.0: Endpoint para limpar arquivo temporário após upload no Drive.
+    v3.8.1: Endpoint para limpar arquivo temporário após upload no Drive.
     O n8n chama este endpoint após confirmar o upload.
     """
     verificar_auth(authorization)
@@ -898,7 +920,7 @@ async def endpoint_coletar_turma(
 ):
     """
     Coleta materiais, textos e arquivos de 1 turma.
-    v3.8.0: Retorna file_key para cada arquivo. O n8n baixa via GET /files/{file_key}.
+    v3.8.1: Retorna file_key para cada arquivo. O n8n baixa via GET /files/{file_key}.
     """
     verificar_auth(authorization)
     job_id = create_classroom_job(f"classroom-turma-{req.turma_nome[:20]}")
