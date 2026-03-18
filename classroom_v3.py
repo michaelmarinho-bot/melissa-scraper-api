@@ -1,10 +1,11 @@
 """
 Classroom V3 — Endpoints fragmentados com download por tipo de arquivo
-Versão: 3.7.1 — Fix ERR_ABORTED no export PDF (tratamento correto do download)
+Versão: 3.8.0 — Arquivos temporários + endpoint de download (sem base64 no JSON)
 
 Endpoints:
   POST /scrape/classroom/turmas  - Lista todas as turmas do Classroom
   POST /scrape/classroom/turma   - Coleta materiais e arquivos de 1 turma (com download)
+  GET  /scrape/classroom/files/{file_key}  - Download de arquivo temporário (NOVO v3.8.0)
 
 Tipos de download suportados:
   - Google Docs   → .pdf (export URL direto) [v3.7.0: era .docx]
@@ -18,10 +19,18 @@ Arquitetura:
   - Cada chamada abre e fecha o browser (1 turma = 1 browser = pouca memória)
   - UMA ÚNICA aba de download é reutilizada para todos os arquivos (fix v3.6.0)
   - O n8n faz o inventário no Drive e orquestra as chamadas
-  - A API faz scraping + download, retorna arquivos em base64
+  - v3.8.0: Arquivos ficam em /tmp/ no servidor. O JSON retorna apenas metadados
+    (nome, tamanho, file_key). O n8n baixa 1 a 1 via GET /files/{file_key}
+    e faz upload no Drive. Isso evita crash de memória no n8n.
   - Export PDF é mais leve e estável que DOCX/PPTX/XLSX (v3.7.0)
   - Fallback do editor removido — evita crash de memória no Render 512MB (v3.7.0)
   - Fix: ERR_ABORTED tratado corretamente no export URL (v3.7.1)
+
+Changelog:
+  v3.8.0 — Arquivos temporários + endpoint GET /files/{file_key}
+            Sem base64 no JSON de resultado → n8n não estoura memória
+  v3.7.1 — Fix ERR_ABORTED no export PDF
+  v3.7.0 — Export PDF para Docs/Slides/Sheets + remover fallbacks pesados
 """
 
 import os
@@ -38,6 +47,7 @@ from typing import Optional, List, Dict, Any
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Header, BackgroundTasks
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 # Reutilizar config do main
@@ -52,6 +62,14 @@ router = APIRouter(prefix="/scrape/classroom", tags=["Classroom V3"])
 
 # Jobs store
 classroom_jobs: Dict[str, Dict[str, Any]] = {}
+
+# v3.8.0: Store de arquivos temporários
+# Formato: { file_key: { "path": "/tmp/...", "filename": "nome.pdf", "size": 12345, "created_at": "..." } }
+temp_files: Dict[str, Dict[str, Any]] = {}
+
+# Diretório para arquivos temporários
+TEMP_DIR = "/tmp/classroom_files"
+os.makedirs(TEMP_DIR, exist_ok=True)
 
 
 # ============================================================
@@ -95,6 +113,33 @@ def create_classroom_job(fonte: str) -> str:
         for k in oldest:
             del classroom_jobs[k]
     return job_id
+
+
+def register_temp_file(file_path: str, filename: str, size: int) -> str:
+    """
+    v3.8.0: Registra um arquivo temporário e retorna uma file_key única.
+    O n8n usa essa key para baixar o arquivo via GET /files/{file_key}.
+    """
+    file_key = uuid.uuid4().hex[:12]
+    temp_files[file_key] = {
+        "path": file_path,
+        "filename": filename,
+        "size": size,
+        "created_at": datetime.now().isoformat(),
+        "downloaded": False
+    }
+    # Limpar arquivos antigos (mais de 50 registros)
+    if len(temp_files) > 50:
+        oldest = sorted(temp_files.keys(), key=lambda k: temp_files[k]["created_at"])[:20]
+        for k in oldest:
+            try:
+                old_path = temp_files[k]["path"]
+                if os.path.exists(old_path):
+                    os.remove(old_path)
+            except:
+                pass
+            del temp_files[k]
+    return file_key
 
 
 # ============================================================
@@ -186,14 +231,14 @@ async def criar_browser(p):
 
 # ============================================================
 # DOWNLOAD HELPERS — Por tipo de arquivo
-# Todas as funções agora recebem uma `page` existente e a REUTILIZAM
-# em vez de criar novas abas (fix v3.6.0 — economia de memória)
+# v3.8.0: Agora salvam em /tmp/ e retornam file_key (sem base64)
 # ============================================================
 
 async def download_drive_file(page, file_id: str, nome: str) -> dict:
     """
     Download de arquivo do Drive (PDF, imagem, Office, etc.)
     REUTILIZA a page existente — navega, baixa, e limpa.
+    v3.8.0: Salva em /tmp/ e retorna file_key.
     """
     try:
         view_url = f"https://drive.google.com/file/d/{file_id}/view"
@@ -208,26 +253,20 @@ async def download_drive_file(page, file_id: str, nome: str) -> dict:
         logger.info(f"[ClassroomV3] Botões de download encontrados: {btn_count}")
 
         if btn_count > 0:
-            # Usar expect_download para capturar o arquivo
             try:
                 async with page.expect_download(timeout=30000) as download_info:
                     await download_btn.first.click()
                 download = await download_info.value
-                # Salvar em temp e ler
-                tmp_path = f"/tmp/classroom_dl_{uuid.uuid4().hex[:8]}"
+                tmp_path = os.path.join(TEMP_DIR, f"dl_{uuid.uuid4().hex[:8]}")
                 await download.save_as(tmp_path)
                 suggested_name = download.suggested_filename or nome
-                with open(tmp_path, "rb") as f:
-                    content = f.read()
-                os.remove(tmp_path)
-                result = {
-                    "data": base64.b64encode(content).decode(),
-                    "size": len(content),
+                file_size = os.path.getsize(tmp_path)
+                file_key = register_temp_file(tmp_path, suggested_name, file_size)
+                return {
+                    "file_key": file_key,
+                    "size": file_size,
                     "filename": suggested_name
                 }
-                del content  # Liberar memória imediatamente
-                gc.collect()
-                return result
             except Exception as e:
                 logger.warning(f"[ClassroomV3] expect_download falhou: {e}, tentando fallback...")
 
@@ -256,22 +295,21 @@ async def download_drive_file(page, file_id: str, nome: str) -> dict:
                 export_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t"
                 try:
                     async with page.expect_download(timeout=30000) as download_info:
-                        await page.goto(export_url)
+                        try:
+                            await page.goto(export_url)
+                        except Exception:
+                            pass  # ERR_ABORTED esperado
                     download = await download_info.value
-                    tmp_path = f"/tmp/classroom_dl_{uuid.uuid4().hex[:8]}"
+                    tmp_path = os.path.join(TEMP_DIR, f"dl_{uuid.uuid4().hex[:8]}")
                     await download.save_as(tmp_path)
                     suggested_name = download.suggested_filename or nome
-                    with open(tmp_path, "rb") as f:
-                        content = f.read()
-                    os.remove(tmp_path)
-                    result = {
-                        "data": base64.b64encode(content).decode(),
-                        "size": len(content),
+                    file_size = os.path.getsize(tmp_path)
+                    file_key = register_temp_file(tmp_path, suggested_name, file_size)
+                    return {
+                        "file_key": file_key,
+                        "size": file_size,
                         "filename": suggested_name
                     }
-                    del content
-                    gc.collect()
-                    return result
                 except Exception as e2:
                     logger.error(f"[ClassroomV3] Fallback download também falhou: {e2}")
                     return {"error": f"Download falhou: {e2}"}
@@ -288,11 +326,7 @@ async def download_drive_file(page, file_id: str, nome: str) -> dict:
 async def download_google_doc(page, file_id: str, nome: str) -> dict:
     """
     Download de Google Docs como .pdf via export URL direto.
-    REUTILIZA a page existente.
-    v3.7.0: Mudou de .docx para .pdf (mais estável, menos memória).
-    v3.7.0: Removido fallback do editor (causava crash de memória no Render 512MB).
-    v3.7.1: Fix ERR_ABORTED — goto lança exceção quando servidor responde com
-            download em vez de página. Agora ignora o erro do goto e captura o download.
+    v3.8.0: Salva em /tmp/ e retorna file_key (sem base64).
     """
     try:
         export_url = f"https://docs.google.com/document/d/{file_id}/export?format=pdf"
@@ -300,36 +334,30 @@ async def download_google_doc(page, file_id: str, nome: str) -> dict:
 
         try:
             async with page.expect_download(timeout=30000) as download_info:
-                # goto lança ERR_ABORTED quando o servidor responde com download
-                # Isso é ESPERADO — ignoramos o erro do goto e capturamos o download
                 try:
                     await page.goto(export_url)
                 except Exception:
                     pass  # ERR_ABORTED esperado para URLs de download
 
             download = await download_info.value
-            tmp_path = f"/tmp/classroom_dl_{uuid.uuid4().hex[:8]}"
+            tmp_path = os.path.join(TEMP_DIR, f"dl_{uuid.uuid4().hex[:8]}")
             await download.save_as(tmp_path)
             suggested_name = download.suggested_filename or f"{nome}.pdf"
-            with open(tmp_path, "rb") as f:
-                content = f.read()
-            os.remove(tmp_path)
-            if len(content) > 0:
-                result = {
-                    "data": base64.b64encode(content).decode(),
-                    "size": len(content),
+            file_size = os.path.getsize(tmp_path)
+            if file_size > 0:
+                file_key = register_temp_file(tmp_path, suggested_name, file_size)
+                logger.info(f"[ClassroomV3] Google Doc baixado OK: {nome} ({file_size} bytes)")
+                return {
+                    "file_key": file_key,
+                    "size": file_size,
                     "filename": suggested_name
                 }
-                del content
-                gc.collect()
-                logger.info(f"[ClassroomV3] Google Doc baixado OK: {nome} ({result['size']} bytes)")
-                return result
             else:
                 logger.warning(f"[ClassroomV3] Download vazio para Google Doc: {nome}")
+                os.remove(tmp_path)
         except Exception as e:
             logger.warning(f"[ClassroomV3] Export PDF falhou para Google Doc: {e}")
 
-        # v3.7.0: Fallback do editor REMOVIDO — causava crash de memória
         logger.warning(f"[ClassroomV3] Google Doc não baixado (sem fallback): {nome}")
         return {"error": f"Export PDF falhou para Google Doc: {nome}"}
 
@@ -341,10 +369,7 @@ async def download_google_doc(page, file_id: str, nome: str) -> dict:
 async def download_google_slides(page, file_id: str, nome: str) -> dict:
     """
     Download de Google Slides como .pdf via export URL direto.
-    REUTILIZA a page existente.
-    v3.7.0: Mudou de .pptx para .pdf (mais estável, menos memória).
-    v3.7.0: Removido fallback do editor (causava crash de memória no Render 512MB).
-    v3.7.1: Fix ERR_ABORTED — ignora erro do goto e captura o download.
+    v3.8.0: Salva em /tmp/ e retorna file_key (sem base64).
     """
     try:
         export_url = f"https://docs.google.com/presentation/d/{file_id}/export?format=pdf"
@@ -358,28 +383,24 @@ async def download_google_slides(page, file_id: str, nome: str) -> dict:
                     pass  # ERR_ABORTED esperado para URLs de download
 
             download = await download_info.value
-            tmp_path = f"/tmp/classroom_dl_{uuid.uuid4().hex[:8]}"
+            tmp_path = os.path.join(TEMP_DIR, f"dl_{uuid.uuid4().hex[:8]}")
             await download.save_as(tmp_path)
             suggested_name = download.suggested_filename or f"{nome}.pdf"
-            with open(tmp_path, "rb") as f:
-                content = f.read()
-            os.remove(tmp_path)
-            if len(content) > 0:
-                result = {
-                    "data": base64.b64encode(content).decode(),
-                    "size": len(content),
+            file_size = os.path.getsize(tmp_path)
+            if file_size > 0:
+                file_key = register_temp_file(tmp_path, suggested_name, file_size)
+                logger.info(f"[ClassroomV3] Google Slides baixado OK: {nome} ({file_size} bytes)")
+                return {
+                    "file_key": file_key,
+                    "size": file_size,
                     "filename": suggested_name
                 }
-                del content
-                gc.collect()
-                logger.info(f"[ClassroomV3] Google Slides baixado OK: {nome} ({result['size']} bytes)")
-                return result
             else:
                 logger.warning(f"[ClassroomV3] Download vazio para Slides: {nome}")
+                os.remove(tmp_path)
         except Exception as e:
             logger.warning(f"[ClassroomV3] Export PDF falhou para Slides: {e}")
 
-        # v3.7.0: Fallback do editor REMOVIDO — causava crash de memória
         logger.warning(f"[ClassroomV3] Google Slides não baixado (sem fallback): {nome}")
         return {"error": f"Export PDF falhou para Google Slides: {nome}"}
 
@@ -391,10 +412,7 @@ async def download_google_slides(page, file_id: str, nome: str) -> dict:
 async def download_google_sheets(page, file_id: str, nome: str) -> dict:
     """
     Download de Google Sheets como .pdf via export URL direto.
-    REUTILIZA a page existente.
-    v3.7.0: Mudou de .xlsx para .pdf (mais estável, menos memória).
-    v3.7.0: Removido fallback do editor (causava crash de memória no Render 512MB).
-    v3.7.1: Fix ERR_ABORTED — ignora erro do goto e captura o download.
+    v3.8.0: Salva em /tmp/ e retorna file_key (sem base64).
     """
     try:
         export_url = f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=pdf"
@@ -408,28 +426,24 @@ async def download_google_sheets(page, file_id: str, nome: str) -> dict:
                     pass  # ERR_ABORTED esperado para URLs de download
 
             download = await download_info.value
-            tmp_path = f"/tmp/classroom_dl_{uuid.uuid4().hex[:8]}"
+            tmp_path = os.path.join(TEMP_DIR, f"dl_{uuid.uuid4().hex[:8]}")
             await download.save_as(tmp_path)
             suggested_name = download.suggested_filename or f"{nome}.pdf"
-            with open(tmp_path, "rb") as f:
-                content = f.read()
-            os.remove(tmp_path)
-            if len(content) > 0:
-                result = {
-                    "data": base64.b64encode(content).decode(),
-                    "size": len(content),
+            file_size = os.path.getsize(tmp_path)
+            if file_size > 0:
+                file_key = register_temp_file(tmp_path, suggested_name, file_size)
+                logger.info(f"[ClassroomV3] Google Sheets baixado OK: {nome} ({file_size} bytes)")
+                return {
+                    "file_key": file_key,
+                    "size": file_size,
                     "filename": suggested_name
                 }
-                del content
-                gc.collect()
-                logger.info(f"[ClassroomV3] Google Sheets baixado OK: {nome} ({result['size']} bytes)")
-                return result
             else:
                 logger.warning(f"[ClassroomV3] Download vazio para Sheets: {nome}")
+                os.remove(tmp_path)
         except Exception as e:
             logger.warning(f"[ClassroomV3] Export PDF falhou para Sheets: {e}")
 
-        # v3.7.0: Fallback do editor REMOVIDO — causava crash de memória
         logger.warning(f"[ClassroomV3] Google Sheets não baixado (sem fallback): {nome}")
         return {"error": f"Export PDF falhou para Google Sheets: {nome}"}
 
@@ -442,14 +456,11 @@ async def download_arquivo(page, anexo: dict) -> dict:
     """
     Router de download — escolhe a estratégia correta por tipo de arquivo.
     REUTILIZA a mesma page para todos os downloads.
-    Retorna dict com data (base64), size, filename ou error.
+    v3.8.0: Retorna dict com file_key, size, filename ou error.
     """
     file_id = anexo.get("fileId", "")
     nome = anexo.get("nome", "arquivo")
     tipo = anexo.get("tipo", "drive_file")
-
-    if not file_id:
-        return {"error": "file_id vazio"}
 
     logger.info(f"[ClassroomV3] Download: {nome} | tipo={tipo} | id={file_id}")
 
@@ -460,187 +471,44 @@ async def download_arquivo(page, anexo: dict) -> dict:
     elif tipo == "google_sheets":
         return await download_google_sheets(page, file_id, nome)
     else:
-        # drive_file: PDF, imagem, Office, etc — formato original
         return await download_drive_file(page, file_id, nome)
 
 
 # ============================================================
-# SCRAPING — LISTAR TURMAS
+# SCRAPING FUNCTIONS
 # ============================================================
+
 async def scrape_listar_turmas(req: TurmasRequest) -> dict:
-    """Lista todas as turmas do Classroom."""
+    """Lista todas as turmas do Google Classroom."""
     from playwright.async_api import async_playwright
 
+    email = req.email or MELISSA_EMAIL
+    password = req.password or MELISSA_PASSWORD
     dados = {"turmas": [], "erros": []}
-    email = req.email or MELISSA_EMAIL
-    password = req.password or MELISSA_PASSWORD
 
     async with async_playwright() as p:
         browser, context, page = await criar_browser(p)
-
         try:
-            login_ok = await google_login(page, email, password)
-            if not login_ok:
-                dados["erros"].append("Falha no login Google")
+            logged_in = await google_login(page, email, password)
+            if not logged_in:
+                dados["erros"].append("Falha no login do Google")
                 return dados
 
-            logger.info("[ClassroomV3] Navegando para Classroom...")
-            await page.goto("https://classroom.google.com/", wait_until="domcontentloaded", timeout=30000)
+            await page.goto("https://classroom.google.com", wait_until="domcontentloaded", timeout=30000)
             await page.wait_for_timeout(5000)
 
-            if "classroom.google.com" not in page.url:
-                dados["erros"].append(f"Não acessou Classroom. URL: {page.url}")
-                return dados
-
-            for _ in range(3):
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(1000)
-
-            turmas_raw = await page.evaluate("""
+            turmas = await page.evaluate("""
                 () => {
-                    const turmas = [];
-                    const cards = document.querySelectorAll('[data-course-id], .gHz6xd, .YVvGBb');
-                    cards.forEach(card => {
-                        const nome = card.querySelector('.YVvGBb, .R4EiSb, h2')?.textContent?.trim() || '';
-                        const secao = card.querySelector('.tL9Q4c, .Mdb1Xb')?.textContent?.trim() || '';
-                        const link = card.querySelector('a[href*="/c/"]')?.href || '';
-                        const courseId = card.getAttribute('data-course-id') || '';
-                        if (nome) {
-                            turmas.push({ nome, secao, link, courseId });
-                        }
-                    });
-                    if (turmas.length === 0) {
-                        document.querySelectorAll('a[href*="/c/"]').forEach(a => {
-                            const nome = a.textContent?.trim() || '';
-                            if (nome && nome.length > 2) {
-                                turmas.push({ nome, secao: '', link: a.href, courseId: '' });
-                            }
-                        });
-                    }
-                    return turmas;
-                }
-            """)
-
-            for turma in turmas_raw:
-                dados["turmas"].append(turma)
-                logger.info(f"[ClassroomV3] Turma: {turma['nome']}")
-
-            if not dados["turmas"]:
-                page_text = await page.evaluate("document.body.innerText")
-                dados["erros"].append(f"Nenhuma turma encontrada. Texto: {page_text[:1000]}")
-
-        except Exception as e:
-            logger.error(f"[ClassroomV3] Erro listar turmas: {e}\n{traceback.format_exc()}")
-            dados["erros"].append(f"Erro: {str(e)}")
-        finally:
-            await browser.close()
-            gc.collect()
-
-    dados["resumo"] = {
-        "total_turmas": len(dados["turmas"]),
-        "total_erros": len(dados["erros"])
-    }
-    return dados
-
-
-# ============================================================
-# SCRAPING — COLETAR 1 TURMA (materiais + texto + download)
-# ============================================================
-async def scrape_coletar_turma(req: TurmaRequest) -> dict:
-    """
-    Coleta materiais, textos e arquivos de 1 turma.
-    Compara com arquivos_existentes (inventário do Drive) e só baixa os novos.
-    Retorna arquivos em base64 para o n8n fazer upload.
-    
-    v3.6.0: Reutiliza UMA ÚNICA aba de download para todos os arquivos.
-    Isso reduz drasticamente o uso de memória (de N abas para 1 aba).
-    v3.7.0: Export PDF para Docs/Slides/Sheets + remoção de fallbacks pesados.
-    """
-    from playwright.async_api import async_playwright
-
-    dados = {
-        "turma": req.turma_nome,
-        "turma_link": req.turma_link,
-        "materiais": [],
-        "arquivos_novos": [],
-        "arquivos_existentes": [],
-        "textos": [],
-        "erros": []
-    }
-
-    email = req.email or MELISSA_EMAIL
-    password = req.password or MELISSA_PASSWORD
-    existentes = set(req.arquivos_existentes)
-
-    if not req.turma_link:
-        dados["erros"].append("turma_link é obrigatório")
-        return dados
-
-    async with async_playwright() as p:
-        browser, context, page = await criar_browser(p)
-
-        try:
-            # 1. Login
-            login_ok = await google_login(page, email, password)
-            if not login_ok:
-                dados["erros"].append("Falha no login Google")
-                return dados
-
-            # 2. Navegar para a aba Atividades da turma
-            course_id_match = re.search(r'/c/(\w+)', req.turma_link)
-            if course_id_match:
-                atividades_url = f"https://classroom.google.com/w/{course_id_match.group(1)}/t/all"
-            else:
-                atividades_url = req.turma_link
-
-            logger.info(f"[ClassroomV3] Acessando turma: {req.turma_nome} -> {atividades_url}")
-            await page.goto(atividades_url, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(5000)
-            logger.info(f"[ClassroomV3] URL após navegar para turma: {page.url}")
-
-            if "classroom.google.com" not in page.url:
-                dados["erros"].append(f"Não acessou a turma. URL: {page.url}")
-                return dados
-
-            # Log do título da página para diagnóstico
-            page_title = await page.title()
-            logger.info(f"[ClassroomV3] Título da página: {page_title}")
-
-            # 3. Rolar para carregar todos os materiais
-            for _ in range(5):
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(1000)
-
-            # 4. Coletar materiais: expandir e extrair info
-            materiais_info = await page.evaluate("""
-                () => {
+                    const cards = document.querySelectorAll('[data-course-id]');
                     const result = [];
-                    const ignorar = ['menu principal', 'google apps', 'minhas inscrições', 
-                                     'conta do google', 'ajuda e comentários', 'filtro de tópicos',
-                                     'opções de temas', 'opções do material', 'opções da atividade',
-                                     'fechar todas', 'recolher tudo', 'seus trabalhos'];
-                    
-                    const items = document.querySelectorAll('div[role="button"]');
-                    items.forEach((el) => {
-                        const hint = el.getAttribute('hint') || '';
-                        const ariaLabel = el.getAttribute('aria-label') || '';
-                        const text = el.textContent?.trim()?.substring(0, 200) || '';
-                        const nome = hint || ariaLabel || text;
-                        const nomeLower = nome.toLowerCase();
-                        
-                        // Filtrar UI e tópicos
-                        const ehUI = ignorar.some(ig => nomeLower.startsWith(ig));
-                        const ehTopico = nomeLower.startsWith('tópico:') || nomeLower.startsWith('topico:');
-                        const ehOpcoes = nomeLower.startsWith('opções');
-                        const ehNavegacao = ['avançar', 'voltar', 'diminuir', 'redefinir', 'aumentar', 
-                                            'fechar', 'abrir com', 'adicionar atalho', 'imprimir', 
-                                            'mais ações', 'editar'].some(n => nomeLower.startsWith(n));
-                        
-                        if (!ehUI && !ehTopico && !ehOpcoes && !ehNavegacao && nome.length > 3) {
+                    cards.forEach(card => {
+                        const link = card.querySelector('a[href*="/c/"]');
+                        const nameEl = card.querySelector('.YVvGBb, .z3vRcc');
+                        const sectionEl = card.querySelector('.bq3UNd, .asQXV');
+                        if (link) {
                             result.push({
-                                nome: nome.substring(0, 200),
-                                hasExpanded: el.hasAttribute('aria-expanded'),
-                                expanded: el.getAttribute('aria-expanded')
+                                nome: (nameEl ? nameEl.textContent.trim() : '') + (sectionEl ? sectionEl.textContent.trim() : ''),
+                                link: link.href.replace('/c/', '/w/') + '/t/all'
                             });
                         }
                     });
@@ -648,35 +516,83 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
                 }
             """)
 
-            logger.info(f"[ClassroomV3] {len(materiais_info)} materiais encontrados")
-            for m in materiais_info:
-                logger.info(f"[ClassroomV3]   Material: {m['nome'][:80]}")
+            for t in turmas:
+                logger.info(f"[ClassroomV3] Turma: {t['nome']}")
+                dados["turmas"].append(t)
 
-            # 5. Expandir todos os materiais que estão fechados
-            await page.evaluate("""
+        except Exception as e:
+            logger.error(f"[ClassroomV3] Erro listar turmas: {e}\n{traceback.format_exc()}")
+            dados["erros"].append(str(e))
+        finally:
+            await browser.close()
+            gc.collect()
+
+    return dados
+
+
+async def scrape_coletar_turma(req: TurmaRequest) -> dict:
+    """
+    Coleta materiais, textos e arquivos de 1 turma do Classroom.
+    v3.8.0: Arquivos ficam em /tmp/, retorna file_key para download posterior.
+    O n8n baixa 1 a 1 via GET /files/{file_key} e faz upload no Drive.
+    """
+    from playwright.async_api import async_playwright
+
+    email = req.email or MELISSA_EMAIL
+    password = req.password or MELISSA_PASSWORD
+    existentes = set(req.arquivos_existentes)
+
+    dados = {
+        "turma": req.turma_nome,
+        "turma_link": req.turma_link,
+        "materiais": [],
+        "textos": [],
+        "arquivos_novos": [],       # v3.8.0: agora contém file_key em vez de base64
+        "arquivos_existentes": [],
+        "erros": [],
+        "resumo": {}
+    }
+
+    async with async_playwright() as p:
+        browser, context, page = await criar_browser(p)
+        try:
+            logged_in = await google_login(page, email, password)
+            if not logged_in:
+                dados["erros"].append("Falha no login do Google")
+                return dados
+
+            # Navegar para a turma
+            logger.info(f"[ClassroomV3] Acessando turma: {req.turma_nome} -> {req.turma_link}")
+            await page.goto(req.turma_link, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(5000)
+
+            current_url = page.url
+            logger.info(f"[ClassroomV3] URL após navegar para turma: {current_url}")
+            title = await page.title()
+            logger.info(f"[ClassroomV3] Título da página: {title}")
+
+            # 5. Expandir todos os materiais
+            materiais_info = await page.evaluate("""
                 () => {
-                    const ignorar = ['menu principal', 'google apps', 'minhas inscrições', 
-                                     'conta do google', 'ajuda e comentários', 'filtro de tópicos',
-                                     'opções de temas', 'opções do material', 'opções da atividade',
-                                     'fechar todas', 'recolher tudo', 'seus trabalhos'];
-                    
-                    const items = document.querySelectorAll('div[role="button"][aria-expanded="false"]');
-                    items.forEach(el => {
-                        const hint = el.getAttribute('hint') || '';
-                        const ariaLabel = el.getAttribute('aria-label') || '';
-                        const text = el.textContent?.trim()?.substring(0, 200) || '';
-                        const nome = (hint || ariaLabel || text).toLowerCase();
-                        
-                        const ehUI = ignorar.some(ig => nome.startsWith(ig));
-                        const ehTopico = nome.startsWith('tópico:') || nome.startsWith('topico:');
-                        const ehOpcoes = nome.startsWith('opções');
-                        
-                        if (!ehUI && !ehTopico && !ehOpcoes && nome.length > 3) {
-                            el.click();
+                    const materiais = [];
+                    const items = document.querySelectorAll('.cBGSjd, .ixkGjd, [data-stream-item-id]');
+                    items.forEach(item => {
+                        const titleEl = item.querySelector('.tLDEHd, .YVvGBb, .asQXV');
+                        const nome = titleEl ? titleEl.textContent.trim() : '';
+                        if (nome) {
+                            materiais.push({ nome });
+                            // Tentar expandir
+                            const expandBtn = item.querySelector('[aria-expanded="false"]');
+                            if (expandBtn) expandBtn.click();
                         }
                     });
+                    return materiais;
                 }
             """)
+
+            logger.info(f"[ClassroomV3] {len(materiais_info)} materiais encontrados")
+            for mat in materiais_info:
+                logger.info(f"[ClassroomV3]   Material: {mat['nome']}")
 
             await page.wait_for_timeout(3000)
 
@@ -691,34 +607,31 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
                             textos.push(text.substring(0, 2000));
                         }
                     });
-                    if (textos.length === 0) {
-                        const allText = document.body.innerText;
-                        textos.push(allText.substring(0, 5000));
-                    }
+                    // Também capturar descrições de atividades
+                    const descDivs = document.querySelectorAll('.cBGSjd .dDKhVc, .ixkGjd .dDKhVc');
+                    descDivs.forEach(div => {
+                        const text = div.textContent?.trim();
+                        if (text && text.length > 10 && !textos.includes(text.substring(0, 2000))) {
+                            textos.push(text.substring(0, 2000));
+                        }
+                    });
                     return textos;
                 }
             """)
             dados["textos"] = textos_materiais
 
-            # 7. Coletar TODOS os anexos (links do Drive/Docs/Slides)
+            # 7. Coletar todos os anexos
             anexos_todos = await page.evaluate("""
                 () => {
                     const anexos = [];
                     
-                    // Método 1: links com hint "Anexo: ..."
-                    document.querySelectorAll('a[hint*="Anexo:"], a[aria-label*="Anexo:"]').forEach(a => {
-                        const hint = a.getAttribute('hint') || a.getAttribute('aria-label') || '';
-                        const nome = a.textContent?.trim()?.split('\\n')[0] || '';
-                        const url = a.href || '';
+                    // Método 1: Links diretos para Google Docs/Slides/Sheets
+                    const links = document.querySelectorAll('a[href*="docs.google.com"], a[href*="drive.google.com"], a[href*="slides.google.com"]');
+                    links.forEach(link => {
+                        const url = link.href;
+                        const nome = link.textContent?.trim() || '';
                         
                         let tipo = 'drive_file';
-                        const hintLower = hint.toLowerCase();
-                        if (hintLower.includes('google docs') || hintLower.includes('documento')) tipo = 'google_doc';
-                        else if (hintLower.includes('google slides') || hintLower.includes('apresentaç')) tipo = 'google_slides';
-                        else if (hintLower.includes('google sheets') || hintLower.includes('planilha')) tipo = 'google_sheets';
-                        else if (hintLower.includes('imagem') || hintLower.includes('image')) tipo = 'imagem';
-                        else if (hintLower.includes('pdf')) tipo = 'pdf';
-                        
                         if (url.includes('docs.google.com/document')) tipo = 'google_doc';
                         else if (url.includes('docs.google.com/presentation') || url.includes('slides.google.com')) tipo = 'google_slides';
                         else if (url.includes('docs.google.com/spreadsheets')) tipo = 'google_sheets';
@@ -727,36 +640,34 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
                         const fileId = match ? match[1] : '';
                         
                         if (fileId && !anexos.find(x => x.fileId === fileId)) {
-                            anexos.push({ nome, url, fileId, tipo, hint });
+                            anexos.push({ nome, url, fileId, tipo, hint: '' });
                         }
                     });
                     
-                    // Método 2: links diretos do Drive/Docs (fallback)
-                    if (anexos.length === 0) {
-                        const seletores = [
-                            'a[href*="drive.google.com/file"]',
-                            'a[href*="docs.google.com/document"]',
-                            'a[href*="docs.google.com/presentation"]',
-                            'a[href*="docs.google.com/spreadsheets"]'
-                        ];
-                        document.querySelectorAll(seletores.join(', ')).forEach(a => {
-                            const nome = a.textContent?.trim()?.split('\\n')[0] || '';
-                            const url = a.href || '';
-                            if (url && nome && !nome.includes('Pasta da turma')) {
-                                let tipo = 'drive_file';
-                                if (url.includes('docs.google.com/document')) tipo = 'google_doc';
-                                else if (url.includes('docs.google.com/presentation')) tipo = 'google_slides';
-                                else if (url.includes('docs.google.com/spreadsheets')) tipo = 'google_sheets';
-                                
-                                const match = url.match(/\\/d\\/([a-zA-Z0-9_-]+)/);
-                                const fileId = match ? match[1] : '';
-                                
-                                if (fileId && !anexos.find(x => x.fileId === fileId)) {
-                                    anexos.push({ nome, url, fileId, tipo, hint: '' });
-                                }
-                            }
-                        });
-                    }
+                    // Método 2: Elementos de anexo do Classroom
+                    const attachments = document.querySelectorAll('.vwNuXe, .QRiHXd, [data-material-id]');
+                    attachments.forEach(att => {
+                        const link = att.querySelector('a[href]');
+                        if (!link) return;
+                        
+                        const url = link.href;
+                        const nome = att.querySelector('.JtCg4, .YVvGBb')?.textContent?.trim() || link.textContent?.trim() || '';
+                        const hint = att.querySelector('.kIKLkd, .bq3UNd')?.textContent?.trim()?.toLowerCase() || '';
+                        
+                        let tipo = 'drive_file';
+                        if (url.includes('docs.google.com/document')) tipo = 'google_doc';
+                        else if (url.includes('docs.google.com/presentation') || url.includes('slides.google.com')) tipo = 'google_slides';
+                        else if (url.includes('docs.google.com/spreadsheets')) tipo = 'google_sheets';
+                        else if (hint.includes('imagem') || hint.includes('image')) tipo = 'imagem';
+                        else if (hint.includes('pdf')) tipo = 'pdf';
+                        
+                        const match = url.match(/\\/d\\/([a-zA-Z0-9_-]+)/);
+                        const fileId = match ? match[1] : '';
+                        
+                        if (fileId && !anexos.find(x => x.fileId === fileId)) {
+                            anexos.push({ nome, url, fileId, tipo, hint: '' });
+                        }
+                    });
                     
                     return anexos;
                 }
@@ -774,7 +685,6 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
                 })
 
             # 8. Para cada anexo: verificar inventário → baixar se novo
-            # >>> FIX v3.6.0: Criar UMA ÚNICA aba de download e reutilizar <<<
             download_page = None
             arquivos_para_baixar = []
 
@@ -810,16 +720,17 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
                         result = await download_arquivo(download_page, anexo)
 
                         if result and not result.get("error") and result.get("size", 0) > 0:
+                            # v3.8.0: Retorna file_key em vez de base64
                             dados["arquivos_novos"].append({
                                 "nome": anexo_nome,
                                 "file_id": file_id,
                                 "tipo": anexo.get("tipo", ""),
                                 "tamanho": result.get("size", 0),
                                 "filename": result.get("filename", anexo_nome),
-                                "conteudo_base64": result.get("data", ""),
+                                "file_key": result.get("file_key", ""),
                                 "turma": req.turma_nome
                             })
-                            logger.info(f"[ClassroomV3] Download OK: {anexo_nome} | {result.get('size', 0)} bytes | {result.get('filename', '')}")
+                            logger.info(f"[ClassroomV3] Download OK: {anexo_nome} | {result.get('size', 0)} bytes | {result.get('filename', '')} | key={result.get('file_key', '')}")
                         else:
                             error_msg = result.get("error", "Erro desconhecido") if result else "Sem resposta"
                             dados["erros"].append(f"Download falhou: {anexo_nome} - {error_msg}")
@@ -918,6 +829,53 @@ def get_turmas_job(job_id: str, authorization: str = Header(None)):
     return job["result"]
 
 
+@router.get("/files/{file_key}")
+async def download_temp_file(file_key: str, authorization: str = Header(None)):
+    """
+    v3.8.0: Endpoint para download de arquivo temporário.
+    O n8n chama este endpoint para baixar 1 arquivo por vez e fazer upload no Drive.
+    Após o download, o arquivo é marcado como baixado (mas não deletado imediatamente).
+    """
+    verificar_auth(authorization)
+    if file_key not in temp_files:
+        raise HTTPException(status_code=404, detail=f"Arquivo {file_key} não encontrado ou já expirou")
+    
+    file_info = temp_files[file_key]
+    file_path = file_info["path"]
+    
+    if not os.path.exists(file_path):
+        del temp_files[file_key]
+        raise HTTPException(status_code=404, detail=f"Arquivo {file_key} não encontrado no disco")
+    
+    file_info["downloaded"] = True
+    logger.info(f"[ClassroomV3] Download temp file: {file_key} -> {file_info['filename']} ({file_info['size']} bytes)")
+    
+    return FileResponse(
+        path=file_path,
+        filename=file_info["filename"],
+        media_type="application/octet-stream"
+    )
+
+
+@router.delete("/files/{file_key}")
+async def delete_temp_file(file_key: str, authorization: str = Header(None)):
+    """
+    v3.8.0: Endpoint para limpar arquivo temporário após upload no Drive.
+    O n8n chama este endpoint após confirmar o upload.
+    """
+    verificar_auth(authorization)
+    if file_key in temp_files:
+        file_info = temp_files[file_key]
+        try:
+            if os.path.exists(file_info["path"]):
+                os.remove(file_info["path"])
+        except:
+            pass
+        del temp_files[file_key]
+        return {"status": "deleted", "file_key": file_key}
+    return {"status": "not_found", "file_key": file_key}
+
+
 @router.post("/turmas")
 async def endpoint_listar_turmas(
     req: TurmasRequest = TurmasRequest(),
@@ -940,8 +898,7 @@ async def endpoint_coletar_turma(
 ):
     """
     Coleta materiais, textos e arquivos de 1 turma.
-    Compara com inventário (arquivos_existentes) e só baixa os novos.
-    Retorna arquivos em base64 + textos para o n8n fazer upload no Drive.
+    v3.8.0: Retorna file_key para cada arquivo. O n8n baixa via GET /files/{file_key}.
     """
     verificar_auth(authorization)
     job_id = create_classroom_job(f"classroom-turma-{req.turma_nome[:20]}")
