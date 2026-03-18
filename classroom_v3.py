@@ -1,6 +1,6 @@
 """
 Classroom V3 — Endpoints fragmentados com download por tipo de arquivo
-Versão: 3.7.0 — Export PDF para Google Docs/Slides/Sheets (economia de memória)
+Versão: 3.7.1 — Fix ERR_ABORTED no export PDF (tratamento correto do download)
 
 Endpoints:
   POST /scrape/classroom/turmas  - Lista todas as turmas do Classroom
@@ -21,6 +21,7 @@ Arquitetura:
   - A API faz scraping + download, retorna arquivos em base64
   - Export PDF é mais leve e estável que DOCX/PPTX/XLSX (v3.7.0)
   - Fallback do editor removido — evita crash de memória no Render 512MB (v3.7.0)
+  - Fix: ERR_ABORTED tratado corretamente no export URL (v3.7.1)
 """
 
 import os
@@ -290,15 +291,22 @@ async def download_google_doc(page, file_id: str, nome: str) -> dict:
     REUTILIZA a page existente.
     v3.7.0: Mudou de .docx para .pdf (mais estável, menos memória).
     v3.7.0: Removido fallback do editor (causava crash de memória no Render 512MB).
+    v3.7.1: Fix ERR_ABORTED — goto lança exceção quando servidor responde com
+            download em vez de página. Agora ignora o erro do goto e captura o download.
     """
     try:
-        # Export URL direto como PDF — mais estável e leve que DOCX
         export_url = f"https://docs.google.com/document/d/{file_id}/export?format=pdf"
         logger.info(f"[ClassroomV3] download_google_doc: {nome} -> export pdf")
 
         try:
             async with page.expect_download(timeout=30000) as download_info:
-                await page.goto(export_url)
+                # goto lança ERR_ABORTED quando o servidor responde com download
+                # Isso é ESPERADO — ignoramos o erro do goto e capturamos o download
+                try:
+                    await page.goto(export_url)
+                except Exception:
+                    pass  # ERR_ABORTED esperado para URLs de download
+
             download = await download_info.value
             tmp_path = f"/tmp/classroom_dl_{uuid.uuid4().hex[:8]}"
             await download.save_as(tmp_path)
@@ -314,13 +322,14 @@ async def download_google_doc(page, file_id: str, nome: str) -> dict:
                 }
                 del content
                 gc.collect()
+                logger.info(f"[ClassroomV3] Google Doc baixado OK: {nome} ({result['size']} bytes)")
                 return result
+            else:
+                logger.warning(f"[ClassroomV3] Download vazio para Google Doc: {nome}")
         except Exception as e:
             logger.warning(f"[ClassroomV3] Export PDF falhou para Google Doc: {e}")
 
         # v3.7.0: Fallback do editor REMOVIDO — causava crash de memória
-        # O editor do Google Docs consome ~200-300MB RAM, inviável no Render 512MB.
-        # Se o export URL falhar, retorna erro e segue para o próximo arquivo.
         logger.warning(f"[ClassroomV3] Google Doc não baixado (sem fallback): {nome}")
         return {"error": f"Export PDF falhou para Google Doc: {nome}"}
 
@@ -335,15 +344,19 @@ async def download_google_slides(page, file_id: str, nome: str) -> dict:
     REUTILIZA a page existente.
     v3.7.0: Mudou de .pptx para .pdf (mais estável, menos memória).
     v3.7.0: Removido fallback do editor (causava crash de memória no Render 512MB).
+    v3.7.1: Fix ERR_ABORTED — ignora erro do goto e captura o download.
     """
     try:
-        # Export URL direto como PDF — mais estável e leve que PPTX
         export_url = f"https://docs.google.com/presentation/d/{file_id}/export?format=pdf"
         logger.info(f"[ClassroomV3] download_google_slides: {nome} -> export pdf")
 
         try:
             async with page.expect_download(timeout=30000) as download_info:
-                await page.goto(export_url)
+                try:
+                    await page.goto(export_url)
+                except Exception:
+                    pass  # ERR_ABORTED esperado para URLs de download
+
             download = await download_info.value
             tmp_path = f"/tmp/classroom_dl_{uuid.uuid4().hex[:8]}"
             await download.save_as(tmp_path)
@@ -359,7 +372,10 @@ async def download_google_slides(page, file_id: str, nome: str) -> dict:
                 }
                 del content
                 gc.collect()
+                logger.info(f"[ClassroomV3] Google Slides baixado OK: {nome} ({result['size']} bytes)")
                 return result
+            else:
+                logger.warning(f"[ClassroomV3] Download vazio para Slides: {nome}")
         except Exception as e:
             logger.warning(f"[ClassroomV3] Export PDF falhou para Slides: {e}")
 
@@ -378,15 +394,19 @@ async def download_google_sheets(page, file_id: str, nome: str) -> dict:
     REUTILIZA a page existente.
     v3.7.0: Mudou de .xlsx para .pdf (mais estável, menos memória).
     v3.7.0: Removido fallback do editor (causava crash de memória no Render 512MB).
+    v3.7.1: Fix ERR_ABORTED — ignora erro do goto e captura o download.
     """
     try:
-        # Export URL direto como PDF — mais estável e leve que XLSX
         export_url = f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=pdf"
         logger.info(f"[ClassroomV3] download_google_sheets: {nome} -> export pdf")
 
         try:
             async with page.expect_download(timeout=30000) as download_info:
-                await page.goto(export_url)
+                try:
+                    await page.goto(export_url)
+                except Exception:
+                    pass  # ERR_ABORTED esperado para URLs de download
+
             download = await download_info.value
             tmp_path = f"/tmp/classroom_dl_{uuid.uuid4().hex[:8]}"
             await download.save_as(tmp_path)
@@ -402,7 +422,10 @@ async def download_google_sheets(page, file_id: str, nome: str) -> dict:
                 }
                 del content
                 gc.collect()
+                logger.info(f"[ClassroomV3] Google Sheets baixado OK: {nome} ({result['size']} bytes)")
                 return result
+            else:
+                logger.warning(f"[ClassroomV3] Download vazio para Sheets: {nome}")
         except Exception as e:
             logger.warning(f"[ClassroomV3] Export PDF falhou para Sheets: {e}")
 
