@@ -1,6 +1,6 @@
 """
 Classroom V3 — Endpoints fragmentados com download por tipo de arquivo
-Versão: 3.9.0 — Coleta via aba Atividades + textos filtrados
+Versão: 3.9.1 — Coleta via aba Atividades + textos filtrados + fileId min 10 chars
 
 Endpoints:
   POST /scrape/classroom/turmas  - Lista todas as turmas do Classroom
@@ -31,6 +31,7 @@ Arquitetura:
   - Fix: ERR_ABORTED tratado corretamente no export URL (v3.7.1)
 
 Changelog:
+  v3.9.1 — Fix regex fileId: mínimo 10 caracteres para evitar IDs inválidos (ex: "e")
   v3.9.0 — Coleta via aba Atividades em vez do Mural
             Expande todos os itens e coleta anexos + textos
             Filtro de textos: só coleta de prova/tarefa/lição/trabalho/OIA
@@ -736,7 +737,7 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
                             const url = a.href;
                             if (url.includes('/folders/')) return;
 
-                            const match = url.match(/\\/d\\/([a-zA-Z0-9_-]+)/);
+                            const match = url.match(/\\/d\\/([a-zA-Z0-9_-]{10,})/);
                             if (match && !seen.has(match[1])) {{
                                 seen.add(match[1]);
                                 let atipo = 'drive_file';
