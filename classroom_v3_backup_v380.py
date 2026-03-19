@@ -1,6 +1,6 @@
 """
 Classroom V3 — Endpoints fragmentados com download por tipo de arquivo
-Versão: 3.9.0 — Coleta via aba Atividades + textos filtrados
+Versão: 3.8.0 — Arquivos temporários + endpoint de download (sem base64 no JSON)
 
 Endpoints:
   POST /scrape/classroom/turmas  - Lista todas as turmas do Classroom
@@ -19,10 +19,6 @@ Arquitetura:
   - Cada chamada abre e fecha o browser (1 turma = 1 browser = pouca memória)
   - UMA ÚNICA aba de download é reutilizada para todos os arquivos (fix v3.6.0)
   - O n8n faz o inventário no Drive e orquestra as chamadas
-  - v3.9.0: FASE 1 agora navega para aba Atividades (/w/XXXXX/t/all),
-    expande todos os itens via JS, coleta anexos e textos.
-    Textos são coletados APENAS de itens filtrados (prova, tarefa, lição,
-    trabalho, OIA) com matéria, conteúdo e data de entrega.
   - v3.8.2: Arquivos ficam em /tmp/ no servidor. O JSON retorna apenas metadados
     (nome, tamanho, file_key). O n8n baixa 1 a 1 via GET /files/{file_key}
     e faz upload no Drive. Isso evita crash de memória no n8n.
@@ -31,10 +27,6 @@ Arquitetura:
   - Fix: ERR_ABORTED tratado corretamente no export URL (v3.7.1)
 
 Changelog:
-  v3.9.0 — Coleta via aba Atividades em vez do Mural
-            Expande todos os itens e coleta anexos + textos
-            Filtro de textos: só coleta de prova/tarefa/lição/trabalho/OIA
-            Retorna matéria, conteúdo, data_entrega nos textos
   v3.8.2 — Download em batches de 2 arquivos com reopen do browser entre batches
             Evita crash de memória no Render 512MB com muitos arquivos
   v3.8.1 — Arquivos temporários + endpoint GET /files/{file_key}
@@ -565,9 +557,6 @@ async def scrape_listar_turmas(req: TurmasRequest) -> dict:
 async def scrape_coletar_turma(req: TurmaRequest) -> dict:
     """
     Coleta materiais, textos e arquivos de 1 turma do Classroom.
-    v3.9.0: Navega para aba Atividades (/w/XXXXX/t/all), expande todos os
-    itens e coleta anexos. Textos são coletados apenas de itens filtrados
-    (prova, tarefa, lição, trabalho, OIA) com matéria, conteúdo e data_entrega.
     v3.8.2: Download em batches de 2 arquivos. Fecha e reabre o browser
     entre batches para liberar memória (Render 512MB).
     Arquivos ficam em /tmp/, retorna file_key para download posterior.
@@ -593,7 +582,6 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
 
     # =============================================
     # FASE 1: Navegar, coletar materiais e anexos
-    # v3.9.0: Navega para aba Atividades, clica item por item
     # =============================================
     arquivos_para_baixar = []
 
@@ -605,204 +593,124 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
                 dados["erros"].append("Falha no login do Google")
                 return dados
 
-            # v3.9.0: Converter URL do Mural para aba Atividades
-            # /c/XXXXX -> /w/XXXXX/t/all
-            atividades_url = req.turma_link
-            if '/c/' in atividades_url:
-                course_id = atividades_url.split('/c/')[-1].split('/')[0].split('?')[0]
-                atividades_url = f"https://classroom.google.com/w/{course_id}/t/all"
-            elif '/w/' in atividades_url and '/t/all' not in atividades_url:
-                atividades_url = atividades_url.rstrip('/') + '/t/all'
-
-            logger.info(f"[ClassroomV3] Acessando turma (aba Atividades): {req.turma_nome} -> {atividades_url}")
-            await page.goto(atividades_url, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(8000)
+            # Navegar para a turma
+            logger.info(f"[ClassroomV3] Acessando turma: {req.turma_nome} -> {req.turma_link}")
+            await page.goto(req.turma_link, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(5000)
 
             current_url = page.url
-            logger.info(f"[ClassroomV3] URL após navegar para aba Atividades: {current_url}")
+            logger.info(f"[ClassroomV3] URL após navegar para turma: {current_url}")
             title = await page.title()
             logger.info(f"[ClassroomV3] Título da página: {title}")
 
-            # v3.9.0: Scroll para carregar todos os itens
-            for _ in range(5):
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(1500)
-            await page.evaluate("window.scrollTo(0, 0)")
-            await page.wait_for_timeout(1000)
-
-            # v3.9.0: Listar itens usando li.tfGBod[data-stream-item-id]
-            items_ids = await page.evaluate("""
+            # 5. Expandir todos os materiais
+            materiais_info = await page.evaluate("""
                 () => {
-                    const items = [];
-                    document.querySelectorAll('li.tfGBod[data-stream-item-id]').forEach(el => {
-                        const id = el.getAttribute('data-stream-item-id');
-                        const titleSpan = el.querySelector('span.Vu2fZd.Cx437e');
-                        const titulo = titleSpan ? titleSpan.textContent.trim() : '';
-                        if (titulo) items.push({ id, titulo });
+                    const materiais = [];
+                    const items = document.querySelectorAll('.cBGSjd, .ixkGjd, [data-stream-item-id]');
+                    items.forEach(item => {
+                        const titleEl = item.querySelector('.tLDEHd, .YVvGBb, .asQXV');
+                        const nome = titleEl ? titleEl.textContent.trim() : '';
+                        if (nome) {
+                            materiais.push({ nome });
+                            const expandBtn = item.querySelector('[aria-expanded="false"]');
+                            if (expandBtn) expandBtn.click();
+                        }
                     });
-                    return items;
+                    return materiais;
                 }
             """)
 
-            logger.info(f"[ClassroomV3] {len(items_ids)} itens encontrados na aba Atividades")
-            for item in items_ids:
-                logger.info(f"[ClassroomV3]   Item: {item['titulo']} (id={item['id']})")
+            logger.info(f"[ClassroomV3] {len(materiais_info)} materiais encontrados")
+            for mat in materiais_info:
+                logger.info(f"[ClassroomV3]   Material: {mat['nome']}")
 
-            # v3.9.0: Filtro de textos
-            FILTRO_PALAVRAS = ['prova', 'tarefa', 'lição', 'licao', 'trabalho', 'oia']
+            await page.wait_for_timeout(3000)
 
-            # v3.9.0: Clicar item por item para expandir e coletar dados
-            all_anexos_ids = set()  # Para deduplicar fileIds
-            anexos_todos = []
+            # 6. Coletar textos dos materiais expandidos
+            textos_materiais = await page.evaluate("""
+                () => {
+                    const textos = [];
+                    const contentDivs = document.querySelectorAll('.OHJHx, .z3vRcc, .asQXV');
+                    contentDivs.forEach(div => {
+                        const text = div.textContent?.trim();
+                        if (text && text.length > 10) {
+                            textos.push(text.substring(0, 2000));
+                        }
+                    });
+                    const descDivs = document.querySelectorAll('.cBGSjd .dDKhVc, .ixkGjd .dDKhVc');
+                    descDivs.forEach(div => {
+                        const text = div.textContent?.trim();
+                        if (text && text.length > 10 && !textos.includes(text.substring(0, 2000))) {
+                            textos.push(text.substring(0, 2000));
+                        }
+                    });
+                    return textos;
+                }
+            """)
+            dados["textos"] = textos_materiais
 
-            for idx, item in enumerate(items_ids):
-                item_id = item['id']
-                logger.info(f"[ClassroomV3] Expandindo item {idx+1}/{len(items_ids)}: {item['titulo']}")
+            # 7. Coletar todos os anexos
+            anexos_todos = await page.evaluate("""
+                () => {
+                    const anexos = [];
+                    
+                    const links = document.querySelectorAll('a[href*="docs.google.com"], a[href*="drive.google.com"], a[href*="slides.google.com"]');
+                    links.forEach(link => {
+                        const url = link.href;
+                        const nome = link.textContent?.trim() || '';
+                        
+                        let tipo = 'drive_file';
+                        if (url.includes('docs.google.com/document')) tipo = 'google_doc';
+                        else if (url.includes('docs.google.com/presentation') || url.includes('slides.google.com')) tipo = 'google_slides';
+                        else if (url.includes('docs.google.com/spreadsheets')) tipo = 'google_sheets';
+                        
+                        const match = url.match(/\\/d\\/([a-zA-Z0-9_-]+)/);
+                        const fileId = match ? match[1] : '';
+                        
+                        if (fileId && !anexos.find(x => x.fileId === fileId)) {
+                            anexos.push({ nome, url, fileId, tipo, hint: '' });
+                        }
+                    });
+                    
+                    const attachments = document.querySelectorAll('.vwNuXe, .QRiHXd, [data-material-id]');
+                    attachments.forEach(att => {
+                        const link = att.querySelector('a[href]');
+                        if (!link) return;
+                        
+                        const url = link.href;
+                        const nome = att.querySelector('.JtCg4, .YVvGBb')?.textContent?.trim() || link.textContent?.trim() || '';
+                        const hint = att.querySelector('.kIKLkd, .bq3UNd')?.textContent?.trim()?.toLowerCase() || '';
+                        
+                        let tipo = 'drive_file';
+                        if (url.includes('docs.google.com/document')) tipo = 'google_doc';
+                        else if (url.includes('docs.google.com/presentation') || url.includes('slides.google.com')) tipo = 'google_slides';
+                        else if (url.includes('docs.google.com/spreadsheets')) tipo = 'google_sheets';
+                        else if (hint.includes('imagem') || hint.includes('image')) tipo = 'imagem';
+                        else if (hint.includes('pdf')) tipo = 'pdf';
+                        
+                        const match = url.match(/\\/d\\/([a-zA-Z0-9_-]+)/);
+                        const fileId = match ? match[1] : '';
+                        
+                        if (fileId && !anexos.find(x => x.fileId === fileId)) {
+                            anexos.push({ nome, url, fileId, tipo, hint: '' });
+                        }
+                    });
+                    
+                    return anexos;
+                }
+            """)
 
-                # Scroll para o item e clicar para expandir
-                await page.evaluate(f"""
-                    () => {{
-                        const el = document.querySelector('li.tfGBod[data-stream-item-id="{item_id}"]');
-                        if (el) el.scrollIntoView({{block: 'center'}});
-                    }}
-                """)
-                await page.wait_for_timeout(500)
+            logger.info(f"[ClassroomV3] {len(anexos_todos)} anexos encontrados")
+            for a in anexos_todos:
+                logger.info(f"[ClassroomV3]   Anexo: {a['nome']} | tipo={a['tipo']} | id={a['fileId']}")
 
-                try:
-                    el = page.locator(f'li.tfGBod[data-stream-item-id="{item_id}"]').first
-                    await el.click(timeout=3000)
-                except Exception:
-                    await page.evaluate(f"""
-                        () => {{
-                            const el = document.querySelector('li.tfGBod[data-stream-item-id="{item_id}"]');
-                            if (el) el.click();
-                        }}
-                    """)
-
-                await page.wait_for_timeout(2500)
-
-                # Coletar dados do LI expandido
-                item_data = await page.evaluate(f"""
-                    (filtro) => {{
-                        const el = document.querySelector('li.tfGBod[data-stream-item-id="{item_id}"]');
-                        if (!el) return null;
-
-                        const text = el.innerText || '';
-                        const lines = text.split('\\n').map(l => l.trim()).filter(l => l.length > 0);
-
-                        let tipo = '';
-                        let titulo = '';
-                        let data_entrega = '';
-                        let data_postagem = '';
-                        let conteudo_lines = [];
-
-                        for (let j = 0; j < lines.length; j++) {{
-                            const line = lines[j];
-
-                            if (line === 'Material' || line === 'Atividade') {{
-                                tipo = line;
-                                continue;
-                            }}
-                            if (!titulo && tipo && line !== 'more_vert' && line !== 'Mais opções' &&
-                                !line.startsWith('Data de entrega:') && !line.startsWith('Item postado:')) {{
-                                titulo = line;
-                                continue;
-                            }}
-                            if (line.startsWith('Data de entrega:')) {{
-                                data_entrega = line.replace('Data de entrega:', '').trim();
-                                continue;
-                            }}
-                            if (line.startsWith('Item postado:')) {{
-                                data_postagem = line.replace('Item postado:', '').trim();
-                                continue;
-                            }}
-
-                            // Skip UI elements
-                            if (line === 'more_vert' || line === 'Mais opções' ||
-                                line === 'Ver material' || line === 'Ver instruções' ||
-                                line === 'Pendente' || line === 'Entregue' || line === 'Atribuída') {{
-                                continue;
-                            }}
-
-                            if (titulo) {{
-                                conteudo_lines.push(line);
-                            }}
-                        }}
-
-                        // Coletar links de anexos DENTRO deste LI
-                        const anexos = [];
-                        const seen = new Set();
-                        el.querySelectorAll('a[href]').forEach(a => {{
-                            const url = a.href;
-                            if (url.includes('/folders/')) return;
-
-                            const match = url.match(/\\/d\\/([a-zA-Z0-9_-]+)/);
-                            if (match && !seen.has(match[1])) {{
-                                seen.add(match[1]);
-                                let atipo = 'drive_file';
-                                if (url.includes('docs.google.com/document')) atipo = 'google_doc';
-                                else if (url.includes('docs.google.com/presentation') || url.includes('slides.google.com')) atipo = 'google_slides';
-                                else if (url.includes('docs.google.com/spreadsheets')) atipo = 'google_sheets';
-
-                                const nome = a.textContent?.trim()?.substring(0, 80) || '';
-                                const hint = a.closest('.vwNuXe, .QRiHXd')?.querySelector('.kIKLkd, .bq3UNd')?.textContent?.trim()?.toLowerCase() || '';
-                                if (hint.includes('imagem') || hint.includes('image')) atipo = 'imagem';
-                                else if (hint.includes('pdf')) atipo = 'pdf';
-
-                                anexos.push({{
-                                    nome: nome,
-                                    fileId: match[1],
-                                    url: url.substring(0, 300),
-                                    tipo: atipo,
-                                    hint: ''
-                                }});
-                            }}
-                        }});
-
-                        const tituloLower = titulo.toLowerCase();
-                        const passaFiltro = filtro.some(p => tituloLower.includes(p));
-
-                        return {{
-                            tipo,
-                            titulo,
-                            data_entrega,
-                            data_postagem,
-                            conteudo: conteudo_lines.join('\\n').substring(0, 1000),
-                            passa_filtro: passaFiltro,
-                            anexos
-                        }};
-                    }}
-                """, FILTRO_PALAVRAS)
-
-                if item_data:
-                    # Salvar material
-                    dados["materiais"].append({
-                        "nome": item_data.get("titulo", item['titulo']),
-                        "tipo": item_data.get("tipo", ""),
-                        "anexos_count": len(item_data.get("anexos", []))
-                    })
-
-                    # Salvar texto se passa no filtro
-                    if item_data.get("passa_filtro") and item_data.get("conteudo", "").strip():
-                        dados["textos"].append({
-                            "materia": req.turma_nome,
-                            "titulo": item_data.get("titulo", ""),
-                            "tipo": item_data.get("tipo", ""),
-                            "conteudo": item_data.get("conteudo", ""),
-                            "data_entrega": item_data.get("data_entrega", ""),
-                            "data_postagem": item_data.get("data_postagem", "")
-                        })
-                        logger.info(f"[ClassroomV3]   Texto coletado: {item_data['titulo']} | data_entrega={item_data.get('data_entrega','')}")
-
-                    # Acumular anexos (deduplicar por fileId)
-                    for a in item_data.get("anexos", []):
-                        fid = a.get("fileId", "")
-                        if fid and fid not in all_anexos_ids:
-                            all_anexos_ids.add(fid)
-                            anexos_todos.append(a)
-                            logger.info(f"[ClassroomV3]   Anexo: {a['nome']} | tipo={a['tipo']} | id={fid}")
-
-            logger.info(f"[ClassroomV3] Total: {len(dados['materiais'])} materiais, {len(dados['textos'])} textos, {len(anexos_todos)} anexos")
+            # Salvar materiais
+            for mat in materiais_info:
+                dados["materiais"].append({
+                    "nome": mat.get("nome", ""),
+                    "anexos_count": len(anexos_todos)
+                })
 
             # Filtrar: só baixar arquivos novos
             for anexo in anexos_todos:
