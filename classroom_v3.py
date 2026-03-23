@@ -1,6 +1,6 @@
 """
 Classroom V3 — Endpoints fragmentados com download por tipo de arquivo
-Versão: 3.9.1 — Coleta via aba Atividades + textos filtrados + fileId min 10 chars
+Versão: 3.9.2 — Fix navegação aba Atividades + expansão correta dos itens
 
 Endpoints:
   POST /scrape/classroom/turmas  - Lista todas as turmas do Classroom
@@ -31,6 +31,9 @@ Arquitetura:
   - Fix: ERR_ABORTED tratado corretamente no export URL (v3.7.1)
 
 Changelog:
+  v3.9.2 — Fix navegação: entra pelo Mural (/c/XXXXX) e clica na aba Atividades
+            Fix expansão: clica no div[role=button][aria-expanded] interno
+            (antes clicava no li.tfGBod que não expandia corretamente)
   v3.9.1 — Fix regex fileId: mínimo 10 caracteres para evitar IDs inválidos (ex: "e")
   v3.9.0 — Coleta via aba Atividades em vez do Mural
             Expande todos os itens e coleta anexos + textos
@@ -606,21 +609,41 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
                 dados["erros"].append("Falha no login do Google")
                 return dados
 
-            # v3.9.0: Converter URL do Mural para aba Atividades
-            # /c/XXXXX -> /w/XXXXX/t/all
-            atividades_url = req.turma_link
-            if '/c/' in atividades_url:
-                course_id = atividades_url.split('/c/')[-1].split('/')[0].split('?')[0]
-                atividades_url = f"https://classroom.google.com/w/{course_id}/t/all"
-            elif '/w/' in atividades_url and '/t/all' not in atividades_url:
-                atividades_url = atividades_url.rstrip('/') + '/t/all'
+            # v3.9.2: Navegar para o Mural primeiro, depois clicar na aba Atividades
+            # Navegar direto para /w/XXXXX/t/all pode dar "Turma não encontrada"
+            mural_url = req.turma_link
+            if '/w/' in mural_url:
+                # Converter /w/XXXXX/... de volta para /c/XXXXX
+                course_id = mural_url.split('/w/')[-1].split('/')[0].split('?')[0]
+                mural_url = f"https://classroom.google.com/c/{course_id}"
+            elif '/c/' not in mural_url:
+                mural_url = req.turma_link  # Usar como está
 
-            logger.info(f"[ClassroomV3] Acessando turma (aba Atividades): {req.turma_nome} -> {atividades_url}")
-            await page.goto(atividades_url, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(8000)
+            logger.info(f"[ClassroomV3] Acessando turma (Mural): {req.turma_nome} -> {mural_url}")
+            await page.goto(mural_url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(5000)
 
             current_url = page.url
-            logger.info(f"[ClassroomV3] URL após navegar para aba Atividades: {current_url}")
+            logger.info(f"[ClassroomV3] URL após Mural: {current_url}")
+
+            # v3.9.2: Clicar na aba Atividades
+            try:
+                atividades_tab = page.locator('a:has-text("Atividades"), a[href*="/t/all"]').first
+                await atividades_tab.click(timeout=5000)
+                logger.info("[ClassroomV3] Clicou na aba Atividades")
+            except Exception:
+                # Fallback: tentar navegar direto
+                if '/c/' in page.url:
+                    course_id = page.url.split('/c/')[-1].split('/')[0].split('?')[0]
+                    fallback_url = f"https://classroom.google.com/w/{course_id}/t/all"
+                    logger.info(f"[ClassroomV3] Fallback: navegando direto para {fallback_url}")
+                    await page.goto(fallback_url, wait_until="domcontentloaded", timeout=30000)
+                else:
+                    logger.warning("[ClassroomV3] Não conseguiu clicar na aba Atividades")
+            await page.wait_for_timeout(5000)
+
+            current_url = page.url
+            logger.info(f"[ClassroomV3] URL após aba Atividades: {current_url}")
             title = await page.title()
             logger.info(f"[ClassroomV3] Título da página: {title}")
 
@@ -669,18 +692,45 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
                 """)
                 await page.wait_for_timeout(500)
 
+                # v3.9.2: Clicar com force=True no div[role="button"] interno
+                # O Google coloca um overlay (div.xVnXCf) que intercepta cliques normais.
+                # force=True ignora o overlay e clica diretamente no botão de expansão.
                 try:
-                    el = page.locator(f'li.tfGBod[data-stream-item-id="{item_id}"]').first
-                    await el.click(timeout=3000)
-                except Exception:
+                    btn_locator = page.locator(f'li.tfGBod[data-stream-item-id="{item_id}"] div[role="button"][aria-expanded]').first
+                    await btn_locator.click(timeout=5000, force=True)
+                    logger.info(f"[ClassroomV3]   Expandido via force=True")
+                except Exception as click_err:
+                    logger.warning(f"[ClassroomV3]   Erro no clique force=True: {click_err}")
+                    # Fallback: clicar via JS
                     await page.evaluate(f"""
                         () => {{
                             const el = document.querySelector('li.tfGBod[data-stream-item-id="{item_id}"]');
-                            if (el) el.click();
+                            if (!el) return;
+                            const btn = el.querySelector('div[role="button"]');
+                            if (btn) btn.click();
+                            else el.click();
                         }}
                     """)
+                    logger.info(f"[ClassroomV3]   Fallback: clicou via JS")
 
-                await page.wait_for_timeout(2500)
+                await page.wait_for_timeout(3000)
+
+                # v3.9.2: Verificar se realmente expandiu
+                is_expanded = await page.evaluate(f"""
+                    () => {{
+                        const el = document.querySelector('li.tfGBod[data-stream-item-id="{item_id}"]');
+                        if (!el) return false;
+                        const btn = el.querySelector('div[role="button"][aria-expanded="true"]');
+                        return !!btn;
+                    }}
+                """)
+                if not is_expanded:
+                    logger.warning(f"[ClassroomV3]   Item NÃO expandiu! Tentando retry com force=True...")
+                    try:
+                        await btn_locator.click(timeout=5000, force=True)
+                    except Exception:
+                        pass
+                    await page.wait_for_timeout(2000)
 
                 # Coletar dados do LI expandido
                 item_data = await page.evaluate(f"""
@@ -737,7 +787,7 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
                             const url = a.href;
                             if (url.includes('/folders/')) return;
 
-                            const match = url.match(/\\/d\\/([a-zA-Z0-9_-]{10,})/);
+                            const match = url.match(/\\/d\\/([a-zA-Z0-9_-]{{10,}})/);
                             if (match && !seen.has(match[1])) {{
                                 seen.add(match[1]);
                                 let atipo = 'drive_file';
