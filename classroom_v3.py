@@ -1,6 +1,7 @@
 """
 Classroom V3 — Endpoints fragmentados com download por tipo de arquivo
-Versão: 3.9.2 — Fix navegação aba Atividades + expansão correta dos itens
+Versão: 3.10.0 — Coleta de textos expandida: todos os itens com tipo Atividade
+            ou título contendo palavras-chave (PT/ES/siglas) são capturados como textos
 
 Endpoints:
   POST /scrape/classroom/turmas  - Lista todas as turmas do Classroom
@@ -31,6 +32,11 @@ Arquitetura:
   - Fix: ERR_ABORTED tratado corretamente no export URL (v3.7.1)
 
 Changelog:
+  v3.10.0 — Coleta de textos expandida:
+            - Filtro ampliado com termos em espanhol, siglas e padrões
+            - Itens com tipo 'Atividade' são SEMPRE capturados como texto
+            - Itens com data_entrega são SEMPRE capturados como texto
+            - Conteúdo vazio não impede mais a captura (título é suficiente)
   v3.9.2 — Fix navegação: entra pelo Mural (/c/XXXXX) e clica na aba Atividades
             Fix expansão: clica no div[role=button][aria-expanded] interno
             (antes clicava no li.tfGBod que não expandia corretamente)
@@ -672,8 +678,22 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
             for item in items_ids:
                 logger.info(f"[ClassroomV3]   Item: {item['titulo']} (id={item['id']})")
 
-            # v3.9.0: Filtro de textos
-            FILTRO_PALAVRAS = ['prova', 'tarefa', 'lição', 'licao', 'trabalho', 'oia']
+            # v3.10.0: Filtro de textos expandido (PT + ES + siglas)
+            FILTRO_PALAVRAS = [
+                # Português
+                'prova', 'tarefa', 'lição', 'licao', 'trabalho', 'oia',
+                'avaliação', 'avaliacao', 'atividade', 'exercício', 'exercicio',
+                'simulado', 'roteiro', 'projeto', 'redacao', 'redação',
+                'pesquisa', 'questão', 'questao', 'dever',
+                # Espanhol
+                'prueba', 'tarea', 'lección', 'leccion', 'trabajo', 'proyecto',
+                'ejercicio', 'examen', 'evaluación', 'evaluacion', 'actividad',
+                'composición', 'composicion',
+                # Siglas comuns
+                'a.o', 'a.d', 'm.d',
+            ]
+            # v3.10.0: Padrões regex para datas no título (ex: "A.O (17/03/2026)")
+            REGEX_DATA_TITULO = re.compile(r'\d{1,2}/\d{1,2}/\d{2,4}')
 
             # v3.9.0: Clicar item por item para expandir e coletar dados
             all_anexos_ids = set()  # Para deduplicar fileIds
@@ -833,17 +853,37 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
                         "anexos_count": len(item_data.get("anexos", []))
                     })
 
-                    # Salvar texto se passa no filtro
-                    if item_data.get("passa_filtro") and item_data.get("conteudo", "").strip():
+                    # v3.10.0: Salvar texto com lógica expandida
+                    # Captura se: (1) passa no filtro de palavras, OU
+                    #              (2) tipo == 'Atividade', OU
+                    #              (3) tem data_entrega, OU
+                    #              (4) título contém data (regex)
+                    titulo_item = item_data.get("titulo", "")
+                    tipo_item = item_data.get("tipo", "")
+                    data_entrega_item = item_data.get("data_entrega", "")
+                    conteudo_item = item_data.get("conteudo", "")
+                    passa_filtro = item_data.get("passa_filtro", False)
+                    eh_atividade = tipo_item.lower() in ['atividade', 'actividad']
+                    tem_data_entrega = bool(data_entrega_item.strip())
+                    tem_data_titulo = bool(REGEX_DATA_TITULO.search(titulo_item))
+
+                    deve_capturar = passa_filtro or eh_atividade or tem_data_entrega or tem_data_titulo
+
+                    if deve_capturar:
                         dados["textos"].append({
                             "materia": req.turma_nome,
-                            "titulo": item_data.get("titulo", ""),
-                            "tipo": item_data.get("tipo", ""),
-                            "conteudo": item_data.get("conteudo", ""),
-                            "data_entrega": item_data.get("data_entrega", ""),
+                            "titulo": titulo_item,
+                            "tipo": tipo_item,
+                            "conteudo": conteudo_item if conteudo_item.strip() else titulo_item,
+                            "data_entrega": data_entrega_item,
                             "data_postagem": item_data.get("data_postagem", "")
                         })
-                        logger.info(f"[ClassroomV3]   Texto coletado: {item_data['titulo']} | data_entrega={item_data.get('data_entrega','')}")
+                        motivo = []
+                        if passa_filtro: motivo.append('filtro')
+                        if eh_atividade: motivo.append('atividade')
+                        if tem_data_entrega: motivo.append('data_entrega')
+                        if tem_data_titulo: motivo.append('data_titulo')
+                        logger.info(f"[ClassroomV3]   Texto coletado: {titulo_item} | motivo={','.join(motivo)} | data_entrega={data_entrega_item}")
 
                     # Acumular anexos (deduplicar por fileId)
                     for a in item_data.get("anexos", []):
