@@ -213,10 +213,36 @@ async def google_login(page, email: str, password: str, max_retries: int = 3):
             email_input = page.locator('input[type="email"]')
             if await email_input.count() > 0 and await email_input.first.is_visible():
                 logger.info("[ClassroomV3] Preenchendo email...")
-                await email_input.fill(email)
+                await email_input.first.click()
+                await page.wait_for_timeout(300)
+                await email_input.first.fill(email)
                 await page.wait_for_timeout(500)
-                await page.locator('#identifierNext button').click()
-                await page.wait_for_timeout(4000)
+
+                # Tentar clicar no botão Avançar, senão usar Enter
+                next_btn = page.locator('#identifierNext button')
+                if await next_btn.count() > 0:
+                    try:
+                        await next_btn.click(timeout=3000)
+                    except Exception:
+                        logger.info("[ClassroomV3] Click no botão falhou, usando Enter...")
+                        await page.keyboard.press('Enter')
+                else:
+                    logger.info("[ClassroomV3] Botão #identifierNext não encontrado, usando Enter...")
+                    await page.keyboard.press('Enter')
+
+                await page.wait_for_timeout(5000)
+
+                # Verificar se a página avançou
+                new_url = page.url
+                logger.info(f"[ClassroomV3] URL após email: {new_url}")
+                if 'identifier' in new_url and 'challenge' not in new_url:
+                    # Página não avançou — tentar Enter novamente
+                    logger.warning("[ClassroomV3] Página não avançou após email. Tentando Enter...")
+                    await email_input.first.click()
+                    await page.keyboard.press('Enter')
+                    await page.wait_for_timeout(5000)
+                    new_url = page.url
+                    logger.info(f"[ClassroomV3] URL após retry Enter: {new_url}")
             else:
                 logger.info("[ClassroomV3] Campo de email não visível — pode já estar no passo de senha")
 
