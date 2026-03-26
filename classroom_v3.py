@@ -167,123 +167,59 @@ def register_temp_file(file_path: str, filename: str, size: int) -> str:
 # ============================================================
 async def google_login(page, email: str, password: str, max_retries: int = 3):
     """
-    Login no Google com tratamento robusto de telas intermediárias.
-    v3.10.0: Lida com 'Choose an account', 'Verify it's you',
-             campo hidden decoy, e timeouts maiores.
+    Login no Google — mesmo código do main.py (SuperApp) que funciona.
+    v3.10.2: Revertido para lógica simples e comprovada.
     """
     for attempt in range(max_retries):
         try:
             logger.info(f"[ClassroomV3] Login tentativa {attempt + 1}/{max_retries}...")
+
+            # Navegar para o login do Google
             await page.goto("https://accounts.google.com/signin", wait_until="domcontentloaded", timeout=30000)
             await page.wait_for_timeout(3000)
 
+            # Verificar se já está logado
             current_url = page.url
-            logger.info(f"[ClassroomV3] URL após navegar: {current_url}")
-
             if "myaccount.google.com" in current_url or "classroom.google.com" in current_url:
-                logger.info("[ClassroomV3] Já logado!")
+                logger.info("[ClassroomV3] Já está logado!")
                 return True
 
-            # --- Tela 'Choose an account' (accountchooser) ---
-            if "accountchooser" in current_url or "ServiceLogin" in current_url:
-                # Tentar clicar na conta existente ou em 'Use another account'
-                account_item = page.locator(f'div[role="link"]:has-text("{email}")')
-                use_another = page.locator('div[role="link"]:has-text("Use another account"), div[role="link"]:has-text("Usar outra conta")')
-
-                if await account_item.count() > 0:
-                    logger.info("[ClassroomV3] Tela 'Choose an account' — clicando na conta existente")
-                    await account_item.first.click()
-                    await page.wait_for_timeout(3000)
-                    current_url = page.url
-                    logger.info(f"[ClassroomV3] URL após escolher conta: {current_url}")
-
-                    # Se foi direto para a senha (challenge/pwd)
-                    if "challenge/pwd" in current_url:
-                        logger.info("[ClassroomV3] Tela de senha detectada após escolher conta")
-                        # Vai direto para o passo de senha abaixo
-                    elif "myaccount.google.com" in current_url or "classroom.google.com" in current_url:
-                        logger.info("[ClassroomV3] Já logado após escolher conta!")
-                        return True
-                elif await use_another.count() > 0:
-                    logger.info("[ClassroomV3] Tela 'Choose an account' — clicando 'Use another account'")
-                    await use_another.first.click()
-                    await page.wait_for_timeout(3000)
-
-            # --- Passo 1: Email ---
+            # Inserir email
             email_input = page.locator('input[type="email"]')
-            if await email_input.count() > 0 and await email_input.first.is_visible():
-                logger.info("[ClassroomV3] Preenchendo email...")
-                await email_input.first.click()
-                await page.wait_for_timeout(300)
-                await email_input.first.fill(email)
-                await page.wait_for_timeout(500)
+            await email_input.wait_for(state="visible", timeout=10000)
+            await email_input.fill(email)
+            await page.wait_for_timeout(500)
+            await page.locator('#identifierNext button').click()
+            await page.wait_for_timeout(4000)
 
-                # Tentar clicar no botão Avançar, senão usar Enter
-                next_btn = page.locator('#identifierNext button')
-                if await next_btn.count() > 0:
-                    try:
-                        await next_btn.click(timeout=3000)
-                    except Exception:
-                        logger.info("[ClassroomV3] Click no botão falhou, usando Enter...")
-                        await page.keyboard.press('Enter')
-                else:
-                    logger.info("[ClassroomV3] Botão #identifierNext não encontrado, usando Enter...")
-                    await page.keyboard.press('Enter')
-
-                await page.wait_for_timeout(5000)
-
-                # Verificar se a página avançou
-                new_url = page.url
-                logger.info(f"[ClassroomV3] URL após email: {new_url}")
-                if 'identifier' in new_url and 'challenge' not in new_url:
-                    # Página não avançou — tentar Enter novamente
-                    logger.warning("[ClassroomV3] Página não avançou após email. Tentando Enter...")
-                    await email_input.first.click()
-                    await page.keyboard.press('Enter')
-                    await page.wait_for_timeout(5000)
-                    new_url = page.url
-                    logger.info(f"[ClassroomV3] URL após retry Enter: {new_url}")
-            else:
-                logger.info("[ClassroomV3] Campo de email não visível — pode já estar no passo de senha")
-
-            # --- Passo 2: Senha ---
-            # Tentar com timeout maior (25s) e log detalhado
+            # Aguardar tela de senha
             password_input = page.locator('input[type="password"]:not([aria-hidden="true"]):not([tabindex="-1"])')
-            try:
-                await password_input.wait_for(state="visible", timeout=25000)
-            except Exception as pwd_err:
-                # Log da URL e conteúdo da página para debug
-                current_url = page.url
-                page_text = await page.inner_text('body')
-                logger.error(f"[ClassroomV3] Campo de senha não apareceu. URL: {current_url}")
-                logger.error(f"[ClassroomV3] Conteúdo da página (primeiros 500 chars): {page_text[:500]}")
-                raise pwd_err
-
+            await password_input.wait_for(state="visible", timeout=15000)
             await password_input.fill(password)
             await page.wait_for_timeout(500)
             await page.locator('#passwordNext button').click()
             await page.wait_for_timeout(5000)
 
+            # Verificar se login foi bem-sucedido
             current_url = page.url
             if "accounts.google.com" not in current_url:
                 logger.info(f"[ClassroomV3] Login OK! URL: {current_url}")
                 return True
 
-            has_captcha = await page.locator('iframe[title*="recaptcha"]:visible').count() > 0
-            if has_captcha:
-                logger.error("[ClassroomV3] CAPTCHA detectado!")
+            # Verificar CAPTCHA real
+            has_visible_captcha = await page.locator('iframe[title*="recaptcha"]:visible').count() > 0
+            if has_visible_captcha:
+                logger.error("[ClassroomV3] CAPTCHA visível detectado!")
                 return False
 
+            # Pode ter redirecionamento extra
             await page.wait_for_timeout(5000)
             current_url = page.url
             if "accounts.google.com" not in current_url:
                 logger.info(f"[ClassroomV3] Login OK (redirect)! URL: {current_url}")
                 return True
 
-            # Log detalhado se login falhou
-            page_text = await page.inner_text('body')
             logger.warning(f"[ClassroomV3] Login pode ter falhado. URL: {current_url}")
-            logger.warning(f"[ClassroomV3] Conteúdo da página: {page_text[:500]}")
 
         except Exception as e:
             logger.error(f"[ClassroomV3] Erro login tentativa {attempt + 1}: {e}")
