@@ -1,6 +1,6 @@
 """
 Classroom V3 — Endpoints fragmentados com download por tipo de arquivo
-Versão: 3.10.0 — Coleta de textos expandida: todos os itens com tipo Atividade
+Versão: 3.10.3 — Fix login: detecta tela 'Escolher conta' e navega direto para Classroom
             ou título contendo palavras-chave (PT/ES/siglas) são capturados como textos
 
 Endpoints:
@@ -167,38 +167,81 @@ def register_temp_file(file_path: str, filename: str, size: int) -> str:
 # ============================================================
 async def google_login(page, email: str, password: str, max_retries: int = 3):
     """
-    Login no Google — mesmo código do main.py (SuperApp) que funciona.
-    v3.10.2: Revertido para lógica simples e comprovada.
+    Login no Google — v3.10.3
+    Melhorias:
+      - Navega direto para classroom.google.com (se já logado, pula login)
+      - Detecta tela "Escolher uma conta" e clica na conta correta
+      - Detecta campo de email OU campo de senha (caso Google pule o email)
+      - Fallback robusto para todos os cenários de login do Google
     """
     for attempt in range(max_retries):
         try:
             logger.info(f"[ClassroomV3] Login tentativa {attempt + 1}/{max_retries}...")
 
-            # Navegar para o login do Google
-            await page.goto("https://accounts.google.com/signin", wait_until="domcontentloaded", timeout=30000)
+            # Estratégia: navegar direto para Classroom
+            # Se já logado, vai direto. Se não, Google redireciona para login.
+            await page.goto("https://classroom.google.com/", wait_until="domcontentloaded", timeout=30000)
             await page.wait_for_timeout(3000)
 
-            # Verificar se já está logado
+            # Verificar se já está logado no Classroom
             current_url = page.url
-            if "myaccount.google.com" in current_url or "classroom.google.com" in current_url:
+            logger.info(f"[ClassroomV3] URL após navegação: {current_url}")
+            if "classroom.google.com" in current_url and "accounts.google.com" not in current_url:
+                logger.info("[ClassroomV3] Já está logado no Classroom!")
+                return True
+            if "myaccount.google.com" in current_url:
                 logger.info("[ClassroomV3] Já está logado!")
                 return True
 
-            # Inserir email
-            email_input = page.locator('input[type="email"]')
-            await email_input.wait_for(state="visible", timeout=10000)
-            await email_input.fill(email)
-            await page.wait_for_timeout(500)
-            await page.locator('#identifierNext button').click()
-            await page.wait_for_timeout(4000)
+            # === CENÁRIO 1: Tela "Escolher uma conta" ===
+            # Google mostra lista de contas quando já fez login antes
+            choose_account = page.locator('div[data-email]')
+            choose_count = await choose_account.count()
+            if choose_count > 0:
+                logger.info(f"[ClassroomV3] Tela 'Escolher conta' detectada ({choose_count} contas)")
+                # Procurar a conta da Melissa
+                target_account = page.locator(f'div[data-email="{email}"]')
+                if await target_account.count() > 0:
+                    logger.info(f"[ClassroomV3] Clicando na conta {email}")
+                    await target_account.first.click()
+                    await page.wait_for_timeout(3000)
+                else:
+                    # Conta não está na lista — clicar em "Usar outra conta"
+                    logger.info("[ClassroomV3] Conta não encontrada, clicando 'Usar outra conta'")
+                    use_another = page.locator('div:has-text("Usar outra conta"), div:has-text("Use another account")')
+                    if await use_another.count() > 0:
+                        await use_another.first.click()
+                        await page.wait_for_timeout(3000)
 
-            # Aguardar tela de senha
+            # === CENÁRIO 2: Campo de email visível ===
+            email_input = page.locator('input[type="email"]')
+            if await email_input.count() > 0 and await email_input.first.is_visible():
+                logger.info("[ClassroomV3] Campo de email visível, preenchendo...")
+                await email_input.fill(email)
+                await page.wait_for_timeout(500)
+                await page.locator('#identifierNext button').click()
+                await page.wait_for_timeout(4000)
+
+            # === CENÁRIO 3: Campo de senha ===
             password_input = page.locator('input[type="password"]:not([aria-hidden="true"]):not([tabindex="-1"])')
-            await password_input.wait_for(state="visible", timeout=15000)
-            await password_input.fill(password)
-            await page.wait_for_timeout(500)
-            await page.locator('#passwordNext button').click()
-            await page.wait_for_timeout(5000)
+            try:
+                await password_input.wait_for(state="visible", timeout=15000)
+                logger.info("[ClassroomV3] Campo de senha visível, preenchendo...")
+                await password_input.fill(password)
+                await page.wait_for_timeout(500)
+                await page.locator('#passwordNext button').click()
+                await page.wait_for_timeout(5000)
+            except Exception as pwd_err:
+                logger.warning(f"[ClassroomV3] Campo de senha não apareceu: {pwd_err}")
+                # Talvez já tenha logado via Choose Account
+                current_url = page.url
+                if "classroom.google.com" in current_url and "accounts.google.com" not in current_url:
+                    logger.info(f"[ClassroomV3] Login OK (via Choose Account)! URL: {current_url}")
+                    return True
+                # Continuar para próxima tentativa
+                if attempt < max_retries - 1:
+                    await page.wait_for_timeout(3000)
+                continue
 
             # Verificar se login foi bem-sucedido
             current_url = page.url
