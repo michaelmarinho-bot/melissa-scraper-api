@@ -1,6 +1,6 @@
 """
 Classroom V3 — Endpoints fragmentados com download por tipo de arquivo
-Versão: 3.10.4 — Fix login: detecta tela 'Escolher conta' (mantém accounts.google.com)
+Versão: 3.10.5 — Fix timezone: browser usa America/Sao_Paulo para datas corretas
             ou título contendo palavras-chave (PT/ES/siglas) são capturados como textos
 
 Endpoints:
@@ -273,6 +273,7 @@ async def criar_browser(p):
         viewport={"width": 1280, "height": 800},
         user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         locale="pt-BR",
+        timezone_id="America/Sao_Paulo",  # v3.10.5: Fix timezone para datas do Classroom
         accept_downloads=True  # Essencial para capturar downloads
     )
     page = await context.new_page()
