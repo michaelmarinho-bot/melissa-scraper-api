@@ -1,6 +1,6 @@
 """
 Classroom V3 — Endpoints fragmentados com download por tipo de arquivo
-Versão: 3.10.5 — Fix timezone: browser usa America/Sao_Paulo para datas corretas
+Versão: 3.10.6 — Fix timezone: subtrai 3h (UTC→BRT) na data_postagem sem mexer no browser
             ou título contendo palavras-chave (PT/ES/siglas) são capturados como textos
 
 Endpoints:
@@ -273,7 +273,6 @@ async def criar_browser(p):
         viewport={"width": 1280, "height": 800},
         user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         locale="pt-BR",
-        timezone_id="America/Sao_Paulo",  # v3.10.5: Fix timezone para datas do Classroom
         accept_downloads=True  # Essencial para capturar downloads
     )
     page = await context.new_page()
@@ -814,8 +813,27 @@ async def scrape_coletar_turma(req: TurmaRequest) -> dict:
                                 data_entrega = line.replace('Data de entrega:', '').trim();
                                 continue;
                             }}
-                            if (line.startsWith('Item postado:')) {{
-                                data_postagem = line.replace('Item postado:', '').trim();
+                            if (line.startsWith('Item postado:') || line.startsWith('Criado em:')) {{
+                                let rawDate = line.replace('Item postado:', '').replace('Criado em:', '').trim();
+                                // Corrigir timezone: servidor roda em UTC, Classroom mostra data UTC.
+                                // Subtrair 3h para converter para BRT (America/Sao_Paulo).
+                                const meses = {{'jan':0,'fev':1,'mar':2,'abr':3,'mai':4,'jun':5,'jul':6,'ago':7,'set':8,'out':9,'nov':10,'dez':11}};
+                                const match = rawDate.match(/(\d{{1,2}})\s+de\s+(\w{{3}})/);
+                                if (match) {{
+                                    const dia = parseInt(match[1]);
+                                    const mesStr = match[2].toLowerCase().replace('.','');
+                                    const mes = meses[mesStr];
+                                    if (mes !== undefined) {{
+                                        const ano = new Date().getFullYear();
+                                        const dateUTC = new Date(Date.UTC(ano, mes, dia, 0, 0, 0));
+                                        dateUTC.setUTCHours(dateUTC.getUTCHours() - 3); // UTC → BRT
+                                        const dBRT = dateUTC.getUTCDate();
+                                        const mBRT = dateUTC.getUTCMonth();
+                                        const mesNomes = ['jan.','fev.','mar.','abr.','mai.','jun.','jul.','ago.','set.','out.','nov.','dez.'];
+                                        rawDate = dBRT + ' de ' + mesNomes[mBRT];
+                                    }}
+                                }}
+                                data_postagem = rawDate;
                                 continue;
                             }}
 
